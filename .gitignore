@@ -1,0 +1,2 @@
+# 构建产物与运行时数据（exe、Qt DLL/插件、config.json、sessions/、memory/）
+build/

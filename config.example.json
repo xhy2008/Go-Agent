@@ -1,0 +1,13 @@
+{
+  "llm": {
+    "base_url": "https://api.deepseek.com",
+    "api_key": "",
+    "model": "deepseek-chat",
+    "context_window": 1000000
+  },
+  "search": {
+    "backend": "",
+    "brave_api_key": "",
+    "searxng_url": ""
+  }
+}
