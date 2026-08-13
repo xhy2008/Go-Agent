@@ -9,5 +9,8 @@
     "backend": "",
     "brave_api_key": "",
     "searxng_url": ""
+  },
+  "embedding": {
+    "model": ""
   }
 }

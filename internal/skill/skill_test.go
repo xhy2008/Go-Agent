@@ -10,7 +10,6 @@ import (
 const sampleSkill = `---
 name: "python-expert"
 description: "适用于Python项目的开发助手"
-triggers: ["python", "pip", "venv"]
 version: "1.0"
 ---
 # 角色指令
@@ -24,24 +23,11 @@ func TestParseFrontmatter(t *testing.T) {
 	if s.Description != "适用于Python项目的开发助手" {
 		t.Errorf("description = %q", s.Description)
 	}
-	if len(s.Triggers) != 3 || s.Triggers[0] != "python" {
-		t.Errorf("triggers = %v", s.Triggers)
-	}
 	if s.Version != "1.0" {
 		t.Errorf("version = %q", s.Version)
 	}
 	if !strings.Contains(s.Body, "Python专家") {
 		t.Errorf("body = %q", s.Body)
-	}
-}
-
-func TestMatch(t *testing.T) {
-	s := Parse(sampleSkill, "test.md")
-	if !s.Match("帮我装个 python 包") {
-		t.Error("should match python")
-	}
-	if s.Match("帮我看看 Go 代码") {
-		t.Error("should not match")
 	}
 }
 

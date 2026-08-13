@@ -9,10 +9,18 @@ import (
 
 // Config 是全局配置。
 type Config struct {
-	LLM    LLMConfig    `json:"llm"`
-	Search SearchConfig `json:"search"`
+	LLM       LLMConfig       `json:"llm"`
+	Search    SearchConfig    `json:"search"`
+	Embedding EmbeddingConfig `json:"embedding"`
 	// Memory 在后续迭代中实现
 	// Memory MemoryConfig `json:"memory"`
+}
+
+// EmbeddingConfig 描述本地语义检索（embedding）配置。
+type EmbeddingConfig struct {
+	// Model GGUF embedding 模型路径（如 D:\models\nomic-embed-text-v1.5.Q8_0.gguf）。
+	// 留空或 "off" 时禁用语义检索，回退 FTS5 全文检索（此时不加载 llama_bridge.dll）。
+	Model string `json:"model"`
 }
 
 // LLMConfig 描述 LLM 连接信息。
@@ -45,6 +53,7 @@ func Default() *Config {
 		Search: SearchConfig{
 			Backend: "",
 		},
+		Embedding: EmbeddingConfig{},
 	}
 }
 
@@ -66,14 +75,7 @@ func Path() (string, error) {
 	return filepath.Join(dir, "config.json"), nil
 }
 
-// MemoryPath 返回长期记忆数据库路径：<程序目录>/memory/agent.db。
-func MemoryPath() (string, error) {
-	dir, err := exeDir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "memory", "agent.db"), nil
-}
+// MemoryPath 已移除：长期记忆由 Agent 通过文件工具维护，不再使用 bbolt 数据库。
 
 // SessionDir 返回会话历史目录：<程序目录>/sessions。
 func SessionDir() (string, error) {

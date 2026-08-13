@@ -1,6 +1,6 @@
 // go-agent GUI 版：基于 miqt（Qt6 Go 绑定，CGO 直调 Qt，无浏览器内核）。
 //
-// 布局：QMainWindow = 顶部栏（标题+模型/搜索/记忆/上下文/状态）
+// 布局：QMainWindow = 顶部栏（标题+模型/搜索/技能/上下文/状态）
 // + 中部（左侧聊天消息列表 + 右侧修改文件 QListWidget）
 // + 底部输入栏（QLineEdit + 发送/停止按钮）。
 //
@@ -99,7 +99,11 @@ type gui struct {
 	tokenLabel  *qt.QLabel
 	modelLabel  *qt.QLabel
 	searchLabel *qt.QLabel
-	memLabel    *qt.QLabel
+	skillLabel  *qt.QLabel
+	cgBtn       *qt.QPushButton // 顶部"重建索引"按钮（手动重建代码图）
+	cgRebuild   bool            // 重建进行中（主线程读写，防重复触发）
+
+	dumpPath string // --dump-system-prompt 输出的调试文件路径（为空表示未启用）
 
 	// updates 是主线程消费的 UI 更新命令队列（后台 goroutine 投递）。
 	updates chan func()
@@ -130,6 +134,9 @@ func (g *gui) run() error {
 
 	g.buildUI()
 	g.setInitialInfo()
+	if g.dumpPath != "" {
+		g.setStatus("已输出 system prompt 到 " + g.dumpPath)
+	}
 
 	// 主线程定时消费 UI 更新（后台 goroutine 只投递函数到 channel）。
 	g.timer = qt.NewQTimer()
@@ -189,10 +196,15 @@ func (g *gui) buildUI() {
 
 	g.modelLabel = g.infoLabel(topLayout, "模型: -")
 	g.searchLabel = g.infoLabel(topLayout, "搜索: -")
-	g.memLabel = g.infoLabel(topLayout, "记忆: -")
+	g.skillLabel = g.infoLabel(topLayout, "技能: -")
 	g.tokenLabel = g.infoLabel(topLayout, "上下文: -")
 	g.statusLabel = g.infoLabel(topLayout, "就绪")
 	topLayout.AddStretch()
+	// 手动重建代码图索引按钮（点击后在后台重建，不阻塞 UI）。
+	g.cgBtn = qt.NewQPushButton3("重建索引")
+	g.cgBtn.SetToolTip("手动重建代码图索引（任务完成后也会自动增量重建）")
+	g.cgBtn.OnClicked(func() { g.rebuildIndex() })
+	topLayout.AddWidget(g.cgBtn.QWidget)
 	rootLayout.AddWidget(topBar)
 
 	// 中部：左侧会话列表 + 聊天消息列表 + 右侧修改文件列表。
@@ -303,13 +315,9 @@ func (g *gui) infoLabel(layout *qt.QHBoxLayout, text string) *qt.QLabel {
 
 // setInitialInfo 填充顶部栏初始信息（主线程）。
 func (g *gui) setInitialInfo() {
-	memCount := "（不可用）"
-	if g.app.MemLong != nil {
-		memCount = fmt.Sprintf("%d 条", g.app.MemLong.Count())
-	}
 	g.modelLabel.SetText("模型: " + g.app.Client.Model())
 	g.searchLabel.SetText("搜索: " + g.app.SearchMgr.BackendName())
-	g.memLabel.SetText("记忆: " + memCount)
+	g.skillLabel.SetText(fmt.Sprintf("技能: %d", len(g.app.Skills)))
 }
 
 // ---- 主线程 UI 更新（后台 goroutine 不得直接调用 Qt 控件） ----
@@ -472,6 +480,31 @@ func (g *gui) newCmdOutputEdit(content string) *qt.QTextEdit {
 // setStatus 更新顶部状态标签（可从任意 goroutine 调用）。
 func (g *gui) setStatus(text string) {
 	g.post(func() { g.statusLabel.SetText(text) })
+}
+
+// rebuildIndex 手动重建代码图索引（后台执行，不阻塞 UI；Store 内部有锁，
+// 与任务结束后的自动重建并发安全）。重建期间按钮禁用并防重入。
+func (g *gui) rebuildIndex() {
+	if g.cgRebuild {
+		return
+	}
+	g.cgRebuild = true
+	g.setStatus("正在重建代码图索引…")
+	g.cgBtn.SetEnabled(false)
+	go func() {
+		start := time.Now()
+		ix, err := g.app.Codegraph.Reindex(g.app.CodegraphRoot)
+		elapsed := time.Since(start).Round(time.Millisecond)
+		g.post(func() {
+			g.cgRebuild = false
+			g.cgBtn.SetEnabled(true)
+			if err != nil {
+				g.setStatus("[错误] 索引重建失败: " + err.Error())
+				return
+			}
+			g.setStatus(fmt.Sprintf("索引重建完成: %d 符号 / %d 关系（%v）", len(ix.Nodes), len(ix.Edges), elapsed))
+		})
+	}()
 }
 
 // refreshSidebar 刷新右侧修改文件列表（QTimer 主线程调用）。
@@ -904,6 +937,46 @@ func (g *gui) pushToken(used, limit int) {
 	g.post(func() { g.tokenLabel.SetText(fmt.Sprintf("上下文: %d/%d", used, limit)) })
 }
 
+// pushUsage 更新为最近一轮 LLM 调用的服务端真实缓存命中统计（用于费用监控）。
+func (g *gui) pushUsage(hit, miss int) {
+	g.post(func() { g.tokenLabel.SetText(fmt.Sprintf("缓存命中: %d | 未命中: %d", hit, miss)) })
+}
+
+// askContinue 在后台 goroutine 中调用：工具调用次数达到上限时弹窗询问用户是否继续。
+// 弹窗必须在 Qt 主线程弹出，故把任务阻塞式投递到主线程并同步等待用户选择；
+// updates 队列满时重试投递，避免弹窗被丢弃导致后台 goroutine 永久阻塞。
+func (g *gui) askContinue(used int) bool {
+	done := make(chan bool, 1)
+	for {
+		select {
+		case g.updates <- func() {
+			res := qt.QMessageBox_Question(g.win.QWidget, "继续执行？",
+				fmt.Sprintf("本轮已执行 %d 次工具调用，已达到上限。是否继续执行？", used))
+			done <- res == qt.QMessageBox__Yes
+		}:
+			return <-done
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
+// askUser 在后台 goroutine 中调用：弹出输入对话框向用户提问（Qt 主线程）。
+// 与 askContinue 相同的阻塞式投递策略，保证对话框一定在主线程弹出。
+func (g *gui) askUser(question string) string {
+	done := make(chan string, 1)
+	for {
+		select {
+		case g.updates <- func() {
+			done <- qt.QInputDialog_GetText(g.win.QWidget, "请回答", question)
+		}:
+			return <-done
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+}
+
 // blockStart 工具开始执行：结束当前 AI 回复，准备命令折叠块（默认展开）。
 // detail 为工具的可读摘要（exec_command 为实际命令，其余为工具名）。
 func (g *gui) blockStart(name, detail string) {
@@ -1013,6 +1086,11 @@ func (g *gui) onSend() {
 				logx.Warn("保存会话快照失败: %v", serr)
 			}
 			g.post(g.refreshSessions)
+		} else {
+			// 输出中断（手动停止或断网）：部分内容已保留在 Agent 消息中，保存 latest 以便重启后续写。
+			if _, serr := session.Save(app.SessionDir, "latest", ag.Messages()); serr != nil {
+				logx.Warn("自动保存会话失败: %v", serr)
+			}
 		}
 	}()
 }

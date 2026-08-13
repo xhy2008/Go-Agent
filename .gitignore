@@ -1,2 +1,16 @@
 # 构建产物与运行时数据（exe、Qt DLL/插件、config.json、sessions/、memory/）
 build/
+# 根目录临时构建的 agent.exe（go build ./cmd/agent 产物）
+/agent.exe
+# go-agent 代码图本地索引缓存（/codegraph 命令或任务后自动重建生成）
+.codegraph/
+# GGUF embedding 模型（139MB，自备，见 README"启用语义检索"）
+models/
+# vendored 克隆（原版 codegraph 源码，仅参考比对用，不入 git）
+third_party/codegraph-upstream/
+# llama.cpp 为 git submodule（third_party/llama.cpp，克隆需 --recursive 或
+# git submodule update --init）；其构建产物由子模块自身 .gitignore 处理
+# llama_bridge.dll 为构建产物，不入库（build-gui.ps1 每次自动构建并复制到 build/）
+third_party/llama-bridge/llama_bridge.dll
+# Trae移植过来的skill
+TRAE-Skills-Copy/

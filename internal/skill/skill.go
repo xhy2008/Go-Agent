@@ -3,26 +3,38 @@
 package skill
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+
+	"go-agent/internal/logx"
 )
+
+// ResidentCategory 常驻分类：该分类的技能默认注入系统提示词，其余分类由模型按需查询。
+const ResidentCategory = "code"
 
 // Skill 是一个技能定义。
 type Skill struct {
-	Name        string   // 技能名
-	Description string   // 描述（注入系统消息）
-	Triggers    []string // 触发词
-	Version     string   // 版本
-	Body        string   // 正文（角色指令，触发时注入）
-	Path        string   // 来源文件
+	Name        string // 技能名
+	Description string // 描述（注入系统消息/技能目录，取首句精简）
+	Version     string // 版本
+	Category    string // 分类：code=常驻，其余（workflow/github/document/research/other）按需查询
+	Body        string // 正文（角色指令，由 Agent 按需读取文件获取）
+	Path        string // 来源文件
 }
 
-// DefaultDir 返回默认技能目录：<工作目录>/.agent/skills。
+// IsResident 报告技能是否属于常驻分类（默认注入系统提示词）。
+func (s *Skill) IsResident() bool { return s.Category == ResidentCategory }
+
+// DefaultDir 返回技能目录：<exe 所在目录>/skills。
+// 技能随程序安装目录部署，不依赖进程工作目录（工作目录随启动位置变化）。
 func DefaultDir() string {
-	wd, _ := os.Getwd()
-	return filepath.Join(wd, ".agent", "skills")
+	exe, err := os.Executable()
+	if err != nil {
+		return filepath.Join(".", "skills") // 兜底：当前目录
+	}
+	return filepath.Join(filepath.Dir(exe), "skills")
 }
 
 // Load 扫描目录下的全部 .md 技能文件。
@@ -49,7 +61,9 @@ func Load(root string) ([]*Skill, error) {
 		}
 		s, err := ParseFile(path)
 		if err != nil {
-			return fmt.Errorf("解析技能 %s 失败: %w", path, err)
+			// 单个文件损坏（读取失败）不拖垮整个技能库：跳过并告警。
+			logx.Warn("跳过无法读取的技能文件 %s: %v", path, err)
+			return nil
 		}
 		if s.Name != "" {
 			skills = append(skills, s)
@@ -59,7 +73,25 @@ func Load(root string) ([]*Skill, error) {
 	if err != nil {
 		return nil, err
 	}
-	return skills, nil
+
+	// 按技能名排序，保证系统消息中的技能摘要与注入顺序确定性；同名技能去重（保留首个）。
+	sort.Slice(skills, func(i, j int) bool { return skills[i].Name < skills[j].Name })
+	return dedupeByName(skills), nil
+}
+
+// dedupeByName 按技能名去重，保留同名首个技能（避免重复定义导致指令冲突）。
+func dedupeByName(skills []*Skill) []*Skill {
+	seen := make(map[string]string, len(skills)) // name -> 首次出现文件路径
+	out := make([]*Skill, 0, len(skills))
+	for _, s := range skills {
+		if first, ok := seen[s.Name]; ok {
+			logx.Warn("技能 %q 重复定义，忽略 %s（保留 %s）", s.Name, s.Path, first)
+			continue
+		}
+		seen[s.Name] = s.Path
+		out = append(out, s)
+	}
+	return out
 }
 
 // ParseFile 解析单个技能文件。
@@ -77,7 +109,6 @@ func ParseFile(path string) (*Skill, error) {
 //	---
 //	name: "python-expert"
 //	description: "..."
-//	triggers: ["python", "pip", "venv"]
 //	version: "1.0"
 //	---
 //	# 角色指令
@@ -96,6 +127,10 @@ func Parse(content, path string) *Skill {
 	}
 	if s.Body == "" {
 		s.Body = body // 无 frontmatter 时整篇作为正文
+	}
+	// 未显式声明分类时，套用内置默认分类表（未收录的技能归为 other 按需查询）。
+	if s.Category == "" {
+		s.Category = defaultCategory(s.Name)
 	}
 	return s
 }
@@ -122,46 +157,14 @@ func (s *Skill) parseFrontmatter(fm string) {
 			s.Description = val
 		case "version":
 			s.Version = val
-		case "triggers":
-			s.Triggers = parseList(val)
+		case "category":
+			s.Category = val
 		}
 	}
 }
 
-// parseList 解析 ["a", "b"] 或 a, b 形式的列表。
-func parseList(v string) []string {
-	v = strings.Trim(v, "[]")
-	parts := strings.Split(v, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		p = strings.Trim(strings.TrimSpace(p), `"'`)
-		if p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// Match 判断用户输入是否命中该技能的任何触发词。
-func (s *Skill) Match(text string) bool {
-	lower := strings.ToLower(text)
-	for _, t := range s.Triggers {
-		if strings.Contains(lower, strings.ToLower(t)) {
-			return true
-		}
-	}
-	return false
-}
-
-// Describe 生成用于系统消息的技能摘要。
+// Describe 生成用于系统消息的技能摘要：仅技能名。
+// 完整指令由 Agent 按需调用 read_skill 工具读取。
 func (s *Skill) Describe() string {
-	var b strings.Builder
-	b.WriteString("- " + s.Name)
-	if s.Description != "" {
-		b.WriteString(": " + s.Description)
-	}
-	if len(s.Triggers) > 0 {
-		b.WriteString("（触发词: " + strings.Join(s.Triggers, ", ") + "）")
-	}
-	return b.String()
+	return "- " + s.Name
 }
