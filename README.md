@@ -7,7 +7,7 @@
 Agent 内置本地代码知识图谱（**codegraph**），一次构建、随改随查，让 Agent 不再靠 grep/glob/Read 反复扫描代码，一次调用即可拿到完整上下文：
 
 - **15 种主流语言统一 tree-sitter 解析**（Go/TS/TSX/JS/JSX/Python/Java/C/C++/C#/PHP/Ruby/Rust/Kotlin/Scala/Dart），所有语言（含 Go）共用一套通用 AST 提取器，符号、调用、引用、接口实现关系全量建图；不再有 go/ast、go/types 的单独解析路径，仅按 tree-sitter 各语言语法节点的差异做少量适配（如 Go 语法无字段名、按子节点位置推断）
-- **SQLite + FTS5 全文索引**：索引持久化到 `<项目根>/.codegraph/codegraph.db`（nodes/edges/files 表 + contentless FTS5 虚拟表），全文检索由 SQLite FTS5 提供（`MATCH` + `rank` 排序），与原版 codegraph 同款方案
+- **SQLite + FTS5 全文索引**：索引持久化到 `<项目根>/.go-agent/codegraph.db`（nodes/edges/files 表 + contentless FTS5 虚拟表），全文检索由 SQLite FTS5 提供（`MATCH` + `rank` 排序），与原版 codegraph 同款方案。索引目录用 `.go-agent` 而非官方 codegraph 的 `.codegraph`，避免两套 schema 不同的数据库共用同名目录互相干扰
 - **深度调用链检索**：`callers`（入边递归，深度可调）、`callees`（出边递归）、`trace`（双向 BFS 调用路径）、`impact`（影响面 blast radius），对齐原版 codegraph 的图遍历能力
 - **细粒度工具集**：6 个独立 MCP 工具（`search`/`node`/`callers`/`callees`/`trace`/`impact`），Agent 按需取图，不再一次性全量返回浪费 token
 - **本地 embedding 语义检索（独家，可选）**：DLL 动态链接 llama.cpp（`llama_bridge.dll`，带 **Vulkan 加速**，无 GPU 时自动回退 CPU），仅在配置了向量化模型（`config.json` 的 `embedding.model`，`EMBED_MODEL` 环境变量可覆盖）时才加载 DLL，全量符号向量化后支持**自然语言模糊查询**——"含义相同但名字不同"的符号也能命中；未配置模型时**完全不加载 DLL**，回退到原版 codegraph 的 FTS5 全文检索方案，零额外依赖。官方版 codegraph 明确不依赖 embedding，无法回答此类模糊语义问题，这是本移植版的增量能力
@@ -27,7 +27,7 @@ Agent 内置本地代码知识图谱（**codegraph**），一次构建、随改�
 ### 工作方式
 
 - **解析**：所有语言（含 Go）统一走 tree-sitter 通用 AST 提取器（一套 `decls` 声明映射表驱动，无语言特判），提取声明/方法/调用/签名/Doc；接口实现关系（`impl` 边）按方法签名匹配建立。
-- **存储**：索引写入 `<项目根>/.codegraph/codegraph.db`（SQLite，单连接 + 跨进程互斥锁），含 `nodes/edges/files` 表与 **contentless FTS5** 虚拟表 `nodes_fts`（全文检索）；符号向量（Vecs）以二进制 blob 随索引持久化。
+- **存储**：索引写入 `<项目根>/.go-agent/codegraph.db`（SQLite，单连接 + 跨进程互斥锁），含 `nodes/edges/files` 表与 **contentless FTS5** 虚拟表 `nodes_fts`（全文检索）；符号向量（Vecs）以二进制 blob 随索引持久化。
 - **同步**：每轮任务结束后台增量重建（mtime + sha256 指纹，未变更文件复用缓存图）；`/codegraph` 或 GUI 按钮手动全量重建。
 - **全文检索**：`internal/codegraph` 的 `Search(query, limit)` 直接执行 `SELECT ... FROM nodes_fts WHERE nodes_fts MATCH ? ORDER BY rank`（FTS5 相关度排序），替代旧的内存词法打分。
 - **语义检索（可选）**：`internal/embed` 通过 syscall **动态加载 `llama_bridge.dll`**（C 桥接层，封装 llama.cpp 的模型加载/向量化 API），仅为全部符号生成向量（文本 = 接收者.符号名 + 签名 + Doc）；查询时先 FTS5 召回候选，再对候选做语义重排（整串精确命中置顶 + 其余余弦 ≥ 0.25 降序）。**未配置模型路径（`config.json` 的 `embedding.model`，`EMBED_MODEL` 可覆盖）时完全不加载 DLL**，直接使用 FTS5 全文检索结果。
@@ -36,7 +36,7 @@ Agent 内置本地代码知识图谱（**codegraph**），一次构建、随改�
 
 `Reindex(root)` 构建索引时按以下规则收集源文件（`goFiles`，对齐官方 codegraph 的 `scanDirectoryWalk`）：
 
-1. **递归遍历**：从项目根递归收集；`.git` 与索引数据目录（`.codegraph` 及 `.codegraph-*`）始终跳过；不可读目录/文件跳过不中断。
+1. **递归遍历**：从项目根递归收集；`.git` 与索引数据目录（`.go-agent` 及 `.go-agent-*`）始终跳过；不可读目录/文件跳过不中断。
 2. **默认忽略清单**（无 `.gitignore` 也生效，对齐官方 `DEFAULT_IGNORE_PATTERNS`）：依赖/构建/缓存/工具输出目录约 90 个——`node_modules/`、`bower_components/`、`.yarn/`、`dist/`、`build/`、`out/`、`.next/`、`.nuxt/`、`coverage/`、`__pycache__/`、`.venv/`、`venv/`、`.mypy_cache/`、`target/`、`.gradle/`、`obj/`、`vendor/`、`Pods/`、`.build/`、`.dart_tool/`、`.pub-cache/`、`.cxx/`、`.cache/` 等，另含 `*.egg-info/`、`cmake-build-*/`、`bazel-*/`、`**/res/{values,layout,drawable,…}*/`（Android 资源目录）。与官方清单**完全一致**（无额外硬编码目录）。
 3. **`.gitignore` 解析**：根目录 `.gitignore` 与默认清单合并进同一个匹配器（因此根 `.gitignore` 的否定规则如 `!vendor/` 可覆盖默认忽略——官方文档的 opt-in 方式）；子目录的 `.gitignore` 各自编译、相对其声明目录求值（同 git 嵌套语义）。目录被忽略即整棵子树不进入，因此"父目录被忽略则子文件无法用 `!` 重纳入"的 git 规则天然成立。项目内的 vendored 目录（如 `third_party/`）由项目 `.gitignore` 治理，不在代码中硬编码。
 4. **文件筛选**：仅收录 `sourceExts` 白名单内的扩展名（15 种语言共 30+ 扩展名，见下方"支持语言"），大小写不敏感；**>1MB 的文件跳过**（生成的 bundle/压缩产物，对齐官方 `MAX_FILE_SIZE`）。
@@ -132,10 +132,13 @@ Go、TypeScript（含 `.mts/.cts`）、TSX、JavaScript（含 `.mjs/.cjs/.jsx`�
 
 > **重要**：构建/测试必须附加 `-tags fts5`（go-sqlite3 的 FTS5 模块在 fts5 build tag 下启用），否则运行时报 `no such module: fts5`。
 
+> **重要**：正式构建请加 `-ldflags "-s -w"`——miqt 的 C++ 绑定按 `-g` 编译，不带此标志的 exe 会携带约 300MB DWARF 调试信息（实测 353MB → 60MB）。`build-gui.ps1` 已内置。
+
 > **首次克隆**：`third_party/llama.cpp` 是 git submodule（语义检索 DLL 编译依赖），请用 `git clone --recursive` 克隆，或克隆后执行 `git submodule update --init`。
 
 ```powershell
-# 构建 agent-gui 并部署 Qt 运行库到 build/（build-gui.ps1 会设置 MSYS2/Go 环境变量）
+# 构建 agent-gui 并部署 Qt 运行库到 build/（build-gui.ps1 会设置 MSYS2/Go 环境变量；
+# 只按导入表解析拷贝实际依赖的 ~27 个 DLL + platforms/qwindows.dll 插件，不再整目录拷贝）
 powershell -File build-gui.ps1
 
 # 构建后直接启动 GUI
@@ -148,13 +151,13 @@ powershell -File build-gui.ps1 -Run
 其他入口：
 
 ```powershell
-# CLI 版本（注意 -tags fts5）
+# CLI 版本（注意 -tags fts5；-ldflags "-s -w" 剥离调试符号）
 $env:CGO_ENABLED = "1"
-go build -tags fts5 -o build/agent.exe ./cmd/agent
+go build -tags fts5 -ldflags "-s -w" -o build/agent.exe ./cmd/agent
 .\build\agent.exe
 
 # GUI 冒烟测试（自动执行后退出）
-go build -tags fts5 -o build/guismoke.exe ./cmd/guismoke
+go build -tags fts5 -ldflags "-s -w" -o build/guismoke.exe ./cmd/guismoke
 .\build\guismoke.exe
 ```
 

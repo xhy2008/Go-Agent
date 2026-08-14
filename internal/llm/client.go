@@ -75,8 +75,9 @@ type chatRequest struct {
 type chatChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string     `json:"content"`
-			ToolCalls []ToolCall `json:"tool_calls"`
+			Content           string     `json:"content"`
+			ReasoningContent  string     `json:"reasoning_content"` // DeepSeek 思考模式：推理文本增量
+			ToolCalls         []ToolCall `json:"tool_calls"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
@@ -94,10 +95,11 @@ type usageInfo struct {
 }
 
 // Chat 调用模型完成一次对话。
-// onContent 收到流式文本增量（可为 nil）；onUsage 在收到末尾 chunk 的用量后回调
+// onContent 收到流式文本增量（可为 nil）；onReasoning 收到思考模式的推理文本增量
+// （可为 nil；DeepSeek V4 思考模式时非空）；onUsage 在收到末尾 chunk 的用量后回调
 // （hit/miss 为服务端报告的缓存命中/未命中 token 数，可为 nil）。
-// 返回完整的 assistant 消息；若模型发起工具调用则填充 ToolCalls。
-func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, onContent func(string), onUsage func(hit, miss int)) (Message, error) {
+// 返回完整的 assistant 消息（含 ReasoningContent 与 ToolCalls）；若模型发起工具调用则填充 ToolCalls。
+func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, onContent func(string), onReasoning func(string), onUsage func(hit, miss int)) (Message, error) {
 	reqBody := chatRequest{
 		Model:    c.model,
 		Messages: messages,
@@ -131,15 +133,16 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []ToolDef, 
 		return Message{}, fmt.Errorf("llm api error %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 
-	return c.readStream(ctx, reqCtx, cancel, resp.Body, onContent, onUsage)
+	return c.readStream(ctx, reqCtx, cancel, resp.Body, onContent, onReasoning, onUsage)
 }
 
-// readStream 解析 SSE 流，累积文本内容与工具调用。
+// readStream 解析 SSE 流，累积推理文本、正文内容与工具调用。
 // 出错（断网/空闲超时/提前关闭）时已累积的部分内容仍随 Message 返回，
 // 供上层保留，避免已生成的输出丢失。
-func (c *Client) readStream(ctx context.Context, reqCtx context.Context, cancel context.CancelFunc, r io.Reader, onContent func(string), onUsage func(hit, miss int)) (Message, error) {
+func (c *Client) readStream(ctx context.Context, reqCtx context.Context, cancel context.CancelFunc, r io.Reader, onContent func(string), onReasoning func(string), onUsage func(hit, miss int)) (Message, error) {
 	msg := Message{Role: "assistant"}
 	var content strings.Builder
+	var reasoning strings.Builder
 	var toolCalls []*ToolCall // 按下标累积流式增量
 
 	// 空闲超时看门狗：任何数据到达都视为活跃；连续无数据超过预算即判定断网。
@@ -195,6 +198,12 @@ func (c *Client) readStream(ctx context.Context, reqCtx context.Context, cancel 
 			usage = chunk.Usage // 用量出现在末尾 chunk，取最后一次
 		}
 		for _, ch := range chunk.Choices {
+			if d := ch.Delta.ReasoningContent; d != "" {
+				reasoning.WriteString(d)
+				if onReasoning != nil {
+					onReasoning(d)
+				}
+			}
 			if d := ch.Delta.Content; d != "" {
 				content.WriteString(d)
 				if onContent != nil {
@@ -219,6 +228,7 @@ func (c *Client) readStream(ctx context.Context, reqCtx context.Context, cancel 
 		}
 	}
 	msg.Content = content.String()
+	msg.ReasoningContent = reasoning.String()
 	for _, tc := range toolCalls {
 		if tc.ID == "" {
 			tc.ID = fmt.Sprintf("call_%d", time.Now().UnixNano())

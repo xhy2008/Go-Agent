@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,7 @@ import (
 	qt "github.com/mappu/miqt/qt6"
 
 	"go-agent/internal/bootstrap"
+	"go-agent/internal/codegraph"
 	"go-agent/internal/llm"
 	"go-agent/internal/logx"
 	"go-agent/internal/session"
@@ -51,6 +53,7 @@ const (
 )
 
 // cmdBlock 是一个命令执行折叠块（标题可点击折叠/展开输出）。
+// think=true 时是模型思考过程折叠块（琥珀色样式，标题带 💭）。
 type cmdBlock struct {
 	box      *qt.QFrame
 	header   *qt.QToolButton
@@ -58,6 +61,7 @@ type cmdBlock struct {
 	detail   string // 标题显示的摘要（exec_command 显示实际命令，其余显示工具名）
 	content  string // 已追加的输出全文
 	expanded bool
+	think    bool
 }
 
 // bubble 是圆角消息气泡：外层 QFrame 绘制圆角背景，内层 QTextEdit 用透明背景承载文本。
@@ -72,7 +76,8 @@ type bubble struct {
 type gui struct {
 	app *bootstrap.App
 
-	win        *qt.QMainWindow
+	win      *qt.QMainWindow
+	central  *qt.QWidget
 	chatScroll *qt.QScrollArea
 	chatBox    *qt.QWidget
 	chatLayout *qt.QVBoxLayout
@@ -89,6 +94,13 @@ type gui struct {
 	fileToggle    *qt.QToolButton
 	sessionPanel  *qt.QWidget // 左侧会话面板（收起时收窄宽度）
 	filePanel     *qt.QWidget // 右侧文件面板（收起时收窄宽度）
+	workBtn       *qt.QPushButton // 会话面板：当前会话工作目录（点击选择）
+	newBtn        *qt.QPushButton // 会话面板末位：新建对话
+
+	// currentSession 当前会话名（"latest"=自动恢复会话；时间戳名=历史会话；""=未命名新会话）。
+	currentSession string
+	// workDir 当前会话的工作目录（绝对路径；Agent 相对路径的基准，已随 SetWorkspace chdir）。
+	workDir string
 
 	splitter *qt.QSplitter // 三栏分割器（收起/展开时显式重排宽度）
 
@@ -102,6 +114,7 @@ type gui struct {
 	skillLabel  *qt.QLabel
 	cgBtn       *qt.QPushButton // 顶部"重建索引"按钮（手动重建代码图）
 	cgRebuild   bool            // 重建进行中（主线程读写，防重复触发）
+	cgStatusKey string          // 自动重建状态栏进度文本的节流键（每 5% 更新一次，主线程维护）
 
 	dumpPath string // --dump-system-prompt 输出的调试文件路径（为空表示未启用）
 
@@ -115,9 +128,11 @@ type gui struct {
 	aiEdit         *qt.QTextEdit
 	aiBubble       *bubble // 当前 AI 气泡（box+edit），流式渲染时同步高度
 	aiMarkdown     string
+	aiReasoning    string // 当前模型的推理文本（思考过程），与 aiMarkdown 同等锁保护
 	aiFlushPending bool
 
 	curBlock *cmdBlock // 当前正在执行的命令折叠块
+	curThink *cmdBlock // 当前模型思考过程折叠块（思考中展开，结束自动折叠）
 
 	cmdBlocks []*cmdBlock // 全部命令折叠块（resize 时同步标题截断宽度）
 
@@ -129,6 +144,12 @@ type gui struct {
 // run 创建 Qt 应用、构建界面并进入事件循环。
 func (g *gui) run() error {
 	g.updates = make(chan func(), 512)
+
+	// 代码图重建进度 → UI：手动重建走覆盖层进度条；任务后/工作区切换的自动重建走状态栏文本。
+	// 该回调在重建 goroutine 内被调用，post 投递到主线程执行，线程安全。
+	g.app.CGEvent = func(e bootstrap.CGEvent) {
+		g.post(func() { g.onCGEvent(e) })
+	}
 
 	qt.NewQApplication(os.Args)
 
@@ -162,6 +183,8 @@ func (g *gui) run() error {
 
 	g.win.Show()
 	g.relayoutPanels() // 让两侧栏默认停在最小宽度，聊天区（及气泡）更宽
+	g.workDir = g.app.Workspace // 初始工作目录 = 进程当前目录（随会话加载可切换）
+	g.updateWorkBtn()
 	g.refreshSessions()
 	// 会话加载延迟到事件循环首帧：Qt 的布局是异步排队的，Show 返回时聊天区尚未完成
 	// 首次布局（chatBox 宽度仍为 0），此时渲染气泡会按宽度下限创建，随后被 resize
@@ -182,6 +205,7 @@ func (g *gui) buildUI() {
 	g.win.SetMinimumSize2(1024, 720)
 
 	central := qt.NewQWidget2()
+	g.central = central
 	rootLayout := qt.NewQVBoxLayout2()
 	rootLayout.SetSpacing(0)
 	central.SetLayout(rootLayout.QLayout)
@@ -226,10 +250,22 @@ func (g *gui) buildUI() {
 	g.sessionToggle.SetStyleSheet(panelHeaderStyle)
 	g.sessionToggle.OnClicked(func() { g.toggleSessionPanel() })
 	sessionPanelLayout.AddWidget(g.sessionToggle.QWidget)
+	// 工作目录按钮：显示当前会话工作目录（短名，完整路径在 tooltip），点击选择其他目录。
+	g.workBtn = qt.NewQPushButton3("工作目录")
+	g.workBtn.SetToolTip("当前会话工作目录（Agent 相对路径的基准）")
+	g.workBtn.SetStyleSheet("QPushButton { border:none; color:#79c0ff; background:#1f2428; padding:4px 8px; text-align:left; } QPushButton:hover { color:#58a6ff; }")
+	g.workBtn.OnClicked(func() { g.pickWorkspace() })
+	sessionPanelLayout.AddWidget(g.workBtn.QWidget)
 	g.sessionList = qt.NewQListWidget(sessionPanel)
 	g.sessionList.SetStyleSheet("QListWidget { border:none; background:#161b22; color:#c9d1d9; }")
 	g.sessionList.OnItemClicked(func(item *qt.QListWidgetItem) { g.loadSession(item.Text()) })
-	sessionPanelLayout.AddWidget(g.sessionList.QWidget)
+	sessionPanelLayout.AddWidget2(g.sessionList.QWidget, 1) // 列表占满剩余空间
+	// 新建对话按钮固定在列表末位（不随列表滚动）。
+	g.newBtn = qt.NewQPushButton3("＋ 新建对话")
+	g.newBtn.SetToolTip("开始一个全新对话（保存时以工作目录命名新会话）")
+	g.newBtn.SetStyleSheet("QPushButton { border:none; color:#9da5b4; background:#1f2428; padding:6px 8px; text-align:left; } QPushButton:hover { color:#ffffff; background:#2d333b; }")
+	g.newBtn.OnClicked(func() { g.newSession() })
+	sessionPanelLayout.AddWidget(g.newBtn.QWidget)
 
 	g.chatScroll = qt.NewQScrollArea2()
 	g.chatScroll.SetWidgetResizable(true)
@@ -483,7 +519,8 @@ func (g *gui) setStatus(text string) {
 }
 
 // rebuildIndex 手动重建代码图索引（后台执行，不阻塞 UI；Store 内部有锁，
-// 与任务结束后的自动重建并发安全）。重建期间按钮禁用并防重入。
+// 与任务结束后的自动重建并发安全）。重建期间禁用按钮防重入；进度经 onCGEvent
+// 实时显示在顶部状态栏。
 func (g *gui) rebuildIndex() {
 	if g.cgRebuild {
 		return
@@ -493,7 +530,7 @@ func (g *gui) rebuildIndex() {
 	g.cgBtn.SetEnabled(false)
 	go func() {
 		start := time.Now()
-		ix, err := g.app.Codegraph.Reindex(g.app.CodegraphRoot)
+		ix, err := g.app.ReindexCodegraph()
 		elapsed := time.Since(start).Round(time.Millisecond)
 		g.post(func() {
 			g.cgRebuild = false
@@ -527,6 +564,8 @@ func (g *gui) toggleSessionPanel() {
 		g.sessionPanel.SetMinimumWidth(panelClosedWidth)
 		g.sessionPanel.SetMaximumWidth(panelClosedWidth)
 		g.sessionList.SetVisible(false)
+		g.workBtn.SetVisible(false)
+		g.newBtn.SetVisible(false)
 		g.sessionToggle.SetText("▶")
 		g.sessionToggle.SetSizePolicy2(qt.QSizePolicy__Preferred, qt.QSizePolicy__Expanding)
 		g.sessionToggle.SetStyleSheet(panelClosedStyle)
@@ -534,6 +573,8 @@ func (g *gui) toggleSessionPanel() {
 		g.sessionPanel.SetMinimumWidth(sessionPanelMinWidth)
 		g.sessionPanel.SetMaximumWidth(sessionPanelMaxWidth)
 		g.sessionList.SetVisible(true)
+		g.workBtn.SetVisible(true)
+		g.newBtn.SetVisible(true)
 		g.sessionToggle.SetText("▾ 会话")
 		g.sessionToggle.SetSizePolicy2(qt.QSizePolicy__Preferred, qt.QSizePolicy__Preferred)
 		g.sessionToggle.SetStyleSheet(panelHeaderStyle)
@@ -594,7 +635,7 @@ func (g *gui) relayoutPanels() {
 	g.updateBubbleWidths() // 聊天区宽度已变化，同步气泡最大宽度
 }
 
-// refreshSessions 刷新左侧会话列表（latest 置顶，其余按时间倒序）。
+// refreshSessions 刷新左侧会话列表（latest 置顶，其余按时间倒序），并选中当前会话。
 func (g *gui) refreshSessions() {
 	names, err := session.List(g.app.SessionDir)
 	if err != nil {
@@ -614,19 +655,82 @@ func (g *gui) refreshSessions() {
 		display = append(display, strings.TrimSuffix(n, ".json"))
 	}
 	g.sessionList.AddItems(display)
+	// 选中当前会话（无匹配则清除选中，如新对话）。
+	idx := -1
+	for i, d := range display {
+		if d == g.currentSession {
+			idx = i
+			break
+		}
+	}
+	g.sessionList.SetCurrentRow(idx)
+}
+
+// ---- 代码图重建进度（onCGEvent 由主线程消费） ----
+
+// onCGEvent 处理代码图重建生命周期事件（主线程），进度实时显示在顶部状态栏：
+// 手动重建（重建索引按钮）与任务后/工作区切换的自动重建共用一条进度流，无需覆盖全窗口。
+func (g *gui) onCGEvent(e bootstrap.CGEvent) {
+	switch e.Kind {
+	case "progress":
+		g.updateCGStatus(e)
+	case "done":
+		g.cgStatusKey = ""
+		if strings.HasPrefix(g.statusLabel.Text(), "正在重建代码图索引") {
+			g.statusLabel.SetText("就绪")
+		}
+	}
+}
+
+// updateCGStatus 更新状态栏的重建进度文本（每 5% 节流，避免逐文件刷屏）。
+func (g *gui) updateCGStatus(e bootstrap.CGEvent) {
+	pct := -1
+	if e.Total > 0 {
+		pct = e.Done * 100 / e.Total
+	}
+	key := fmt.Sprintf("%s|%d", e.Phase, pct/5)
+	if key == g.cgStatusKey {
+		return
+	}
+	g.cgStatusKey = key
+	text := "正在重建代码图索引… " + cgPhaseName(e.Phase)
+	if pct >= 0 {
+		text += fmt.Sprintf("（%d%%）", pct)
+	}
+	g.statusLabel.SetText(text)
+}
+
+// cgPhaseName 索引重建阶段的用户可读名称。
+func cgPhaseName(p codegraph.ProgressPhase) string {
+	switch p {
+	case codegraph.ProgressScan:
+		return "扫描文件"
+	case codegraph.ProgressParse:
+		return "解析源码"
+	case codegraph.ProgressBuild:
+		return "建立关系图"
+	case codegraph.ProgressVec:
+		return "语义向量化"
+	case codegraph.ProgressSave:
+		return "保存索引"
+	}
+	return string(p)
 }
 
 // restoreLatest 启动时自动恢复 latest 会话（若存在），方便从上一次进度继续。
 func (g *gui) restoreLatest() {
-	msgs, err := session.Load(g.app.SessionDir, "latest")
+	rec, err := session.Load(g.app.SessionDir, "latest")
 	if err != nil {
 		return
 	}
-	if len(msgs) == 0 {
+	if len(rec.Messages) == 0 {
 		return
 	}
-	g.app.Agent.SetMessages(msgs)
-	g.renderMessages(msgs)
+	g.currentSession = "latest"
+	g.applyWorkspace(rec.WorkingDir)
+	g.app.Agent.SetMessages(rec.Messages)
+	g.renderMessages(rec.Messages)
+	g.refreshSessions() // 选中 latest
 	g.setStatus("已恢复上次会话（latest）")
 }
 
@@ -642,15 +746,92 @@ func (g *gui) loadSession(name string) {
 		g.setStatus("任务运行中，请先停止再切换会话")
 		return
 	}
-	msgs, err := session.Load(g.app.SessionDir, name)
+	rec, err := session.Load(g.app.SessionDir, name)
 	if err != nil {
 		g.setStatus("[错误] 加载会话失败: " + err.Error())
 		return
 	}
-	g.app.Agent.SetMessages(msgs)
+	g.currentSession = name
+	g.applyWorkspace(rec.WorkingDir)
+	g.app.Agent.SetMessages(rec.Messages)
 	g.clearChat()
-	g.renderMessages(msgs)
+	g.renderMessages(rec.Messages)
+	g.refreshSessions() // 选中刚切换的会话
 	g.setStatus("已切换会话: " + name)
+}
+
+// newSession 开始一个全新对话：清空消息与聊天区；发送首条消息时保存为新的时间戳会话。
+func (g *gui) newSession() {
+	g.mu.Lock()
+	running := g.running
+	g.mu.Unlock()
+	if running {
+		g.setStatus("任务运行中，请先停止再新建对话")
+		return
+	}
+	g.currentSession = ""
+	g.app.Agent.Reset()
+	tools.ResetModified()
+	g.clearChat()
+	g.refreshSessions() // 清除列表选中
+	g.setStatus("已新建对话（可在上方选择工作目录）")
+}
+
+// applyWorkspace 应用会话的工作目录（空则保持当前），同步 chdir 与 codegraph 根。
+// 仅主线程调用。
+func (g *gui) applyWorkspace(dir string) {
+	if dir == "" {
+		return
+	}
+	if err := g.app.SetWorkspace(dir); err != nil {
+		g.setStatus("[警告] 工作目录切换失败: " + err.Error())
+		return
+	}
+	g.workDir = dir
+	g.updateWorkBtn()
+}
+
+// pickWorkspace 弹出目录选择框设置当前会话的工作目录。
+func (g *gui) pickWorkspace() {
+	g.mu.Lock()
+	running := g.running
+	g.mu.Unlock()
+	if running {
+		g.setStatus("任务运行中，请先停止再切换工作目录")
+		return
+	}
+	start := g.workDir
+	if start == "" {
+		start = g.app.Workspace
+	}
+	dir := qt.QFileDialog_GetExistingDirectory3(g.win.QWidget, "选择工作目录", start)
+	if dir == "" {
+		return
+	}
+	g.applyWorkspace(dir)
+	g.setStatus("工作目录: " + dir)
+}
+
+// updateWorkBtn 更新工作目录按钮文本：显示目录短名，完整路径在 tooltip。
+func (g *gui) updateWorkBtn() {
+	if g.workBtn == nil {
+		return
+	}
+	dir := g.workDir
+	if dir == "" {
+		dir = g.app.Workspace
+	}
+	if dir == "" {
+		g.workBtn.SetText("工作目录: -")
+		g.workBtn.SetToolTip("")
+		return
+	}
+	short := dir
+	if base := filepath.Base(dir); base != "." && base != string(filepath.Separator) {
+		short = base
+	}
+	g.workBtn.SetText("工作目录: " + short)
+	g.workBtn.SetToolTip("当前会话工作目录（Agent 相对路径的基准）: " + dir + "（点击选择其他目录）")
 }
 
 // clearChat 清空聊天区所有消息与命令块（须在主线程调用）。
@@ -692,6 +873,10 @@ func (g *gui) renderMessages(msgs []llm.Message) {
 						toolDetails[tc.ID] = strings.TrimSpace(cmd)
 					}
 				}
+			}
+			// 思考过程渲染为可折叠的思考块（默认折叠，可展开查看）。
+			if m.ReasoningContent != "" {
+				g.newThinkBlock(m.ReasoningContent, false)
 			}
 			if m.Content != "" {
 				g.addAIMessageStaticUI(m.Content)
@@ -776,6 +961,9 @@ func oneLine(s string) string {
 // 在创建、折叠/展开（箭头变化）、聊天区宽度变化时调用。
 func (g *gui) setCmdTitle(blk *cmdBlock) {
 	title := blk.detail
+	if blk.think {
+		title = "💭 " + title
+	}
 	if blk.expanded {
 		title = "▾ " + title
 	} else {
@@ -883,6 +1071,65 @@ func (g *gui) newCmdBlockUI(blk *cmdBlock, detail string) {
 	g.setCmdTitle(blk)
 }
 
+// newThinkBlock 创建模型思考过程折叠块（琥珀色样式，标题带 💭）。
+// expanded=true 用于流式思考中（标题"思考中…"）；false 用于历史会话渲染（标题"思考过程"，默认折叠）。
+func (g *gui) newThinkBlock(content string, expanded bool) *cmdBlock {
+	blk := &cmdBlock{think: true, content: content, expanded: expanded}
+	if expanded {
+		blk.detail = "思考中…"
+	} else {
+		blk.detail = "思考过程"
+	}
+	box := qt.NewQFrame2()
+	box.SetStyleSheet("QFrame { border:1px solid #9e6a03; border-radius:10px; background:#2b2618; }")
+	box.SetSizePolicy2(qt.QSizePolicy__Preferred, qt.QSizePolicy__Fixed) // 防垂直拉伸
+	boxLayout := qt.NewQVBoxLayout2()
+	boxLayout.SetSpacing(2)
+	boxLayout.SetContentsMargins(8, 2, 8, 2)
+	box.SetLayout(boxLayout.QLayout)
+	blk.box = box
+
+	header := qt.NewQToolButton2()
+	header.SetToolButtonStyle(qt.ToolButtonTextOnly)
+	header.SetStyleSheet("QToolButton { border:none; color:#e3b341; font-weight:bold; padding:2px 8px; text-align:left; } QToolButton:hover { color:#f0c674; }")
+	// 水平策略用 Ignored：标题文本按当前宽度截断（见 newCmdBlockUI 注释）。
+	header.SetSizePolicy2(qt.QSizePolicy__Ignored, qt.QSizePolicy__Preferred)
+	header.OnClicked(func() { g.toggleBlock(blk) })
+	boxLayout.AddWidget(header.QWidget)
+	blk.header = header
+	g.wireHeaderContextMenu(header, blk)
+
+	output := g.newCmdOutputEdit(content)
+	output.SetStyleSheet("QTextEdit { background:#241f12; color:#c8b273; border:1px solid #9e6a03; border-radius:6px; font-family:Consolas; font-size:13px; }")
+	boxLayout.AddWidget(output.QWidget)
+	blk.output = output
+
+	g.chatLayout.AddWidget(box.QWidget)
+	g.cmdBlocks = append(g.cmdBlocks, blk)
+	g.setCmdTitle(blk)
+	return blk
+}
+
+// closeThink 思考结束：把当前思考块折叠（标题改为"思考过程"），并从当前状态清除。
+// 折叠前用最新推理文本刷新内容（流式增量可能被 updates 队列丢弃，这里兜底保证完整）。
+// 须在主线程调用；无进行中的思考时为空操作。
+func (g *gui) closeThink() {
+	if g.curThink == nil {
+		return
+	}
+	blk := g.curThink
+	g.mu.Lock()
+	blk.content = g.aiReasoning
+	g.mu.Unlock()
+	blk.output.SetPlainText(blk.content)
+	g.fixEditHeight(blk.output)
+	blk.expanded = false
+	blk.output.SetVisible(false)
+	blk.detail = "思考过程"
+	g.setCmdTitle(blk)
+	g.curThink = nil
+}
+
 // toggleBlock 点击标题切换折叠/展开（主线程调用）。
 // 注意：切换时保持当前滚动位置，不滚动到底部（避免打断用户阅读）。
 func (g *gui) toggleBlock(blk *cmdBlock) {
@@ -912,11 +1159,41 @@ func (g *gui) pushText(s string) {
 	g.mu.Unlock()
 }
 
+// pushReasoning 模型思考过程（reasoning_content）流式增量：累积全文并实时渲染到
+// 思考折叠块（展开状态，标题"思考中…"）。思考结束由正文开始（renderAI）、工具执行
+// （blockStart）或回合结束（finishTurn）自动折叠。后台 goroutine 调用，线程安全。
+func (g *gui) pushReasoning(s string) {
+	g.mu.Lock()
+	g.aiReasoning += s
+	text := g.aiReasoning
+	g.mu.Unlock()
+	g.post(func() {
+		if g.curThink == nil {
+			g.curThink = g.newThinkBlock("", true)
+		}
+		blk := g.curThink
+		blk.content = text
+		blk.output.SetPlainText(text)
+		g.fixEditHeight(blk.output)
+		if !blk.expanded {
+			blk.expanded = true
+			g.setCmdTitle(blk)
+		}
+		blk.output.SetVisible(true)
+		g.scrollToBottom()
+	})
+}
+
 // renderAI 渲染当前 AI 回复（须在主线程执行）。
+// 思考文本后出现正文增量即视为思考结束，先把思考块折叠。
 func (g *gui) renderAI() {
 	g.mu.Lock()
 	md := g.aiMarkdown
+	reasoning := g.aiReasoning
 	g.mu.Unlock()
+	if reasoning != "" {
+		g.closeThink()
+	}
 	if md == "" {
 		return
 	}
@@ -986,6 +1263,7 @@ func (g *gui) blockStart(name, detail string) {
 	g.mu.Unlock()
 	// 所有 aiMarkdown/aiEdit 的清理都在主线程执行，避免数据竞态。
 	g.post(func() {
+		g.closeThink() // 工具执行开始：本轮思考已结束，折叠思考块
 		g.mu.Lock()
 		g.aiMarkdown = ""
 		g.aiFlushPending = false
@@ -1069,6 +1347,8 @@ func (g *gui) onSend() {
 
 	ag := g.app.Agent
 	app := g.app
+	cur := g.currentSession // 主线程快照：当前会话名（"" = 新对话）
+	wd := g.workDir         // 主线程快照：当前会话工作目录
 	go func() {
 		_, err := ag.Run(ctx, text)
 		g.mu.Lock()
@@ -1077,18 +1357,29 @@ func (g *gui) onSend() {
 		if stillRunning {
 			g.finishTurn(err)
 		}
+		rec := session.Record{WorkingDir: wd, Messages: ag.Messages()}
 		if err == nil {
-			if _, serr := session.Save(app.SessionDir, "latest", ag.Messages()); serr != nil {
-				logx.Warn("自动保存会话失败: %v", serr)
+			// 已加载的会话：覆盖原文件（追加新消息）；新对话：生成时间戳会话并记住名称。
+			if cur != "" {
+				if _, serr := session.Save(app.SessionDir, cur, rec); serr != nil {
+					logx.Warn("自动保存会话失败: %v", serr)
+				}
+			} else {
+				if p, serr := session.Save(app.SessionDir, "", rec); serr != nil {
+					logx.Warn("保存新会话失败: %v", serr)
+				} else {
+					name := strings.TrimSuffix(filepath.Base(p), ".json")
+					g.post(func() { g.currentSession = name })
+				}
 			}
-			// 同时保存时间戳快照，供左侧会话列表切换历史进度。
-			if _, serr := session.Save(app.SessionDir, "", ag.Messages()); serr != nil {
-				logx.Warn("保存会话快照失败: %v", serr)
+			// 同步 latest：下次启动恢复最近一次对话。
+			if _, serr := session.Save(app.SessionDir, "latest", rec); serr != nil {
+				logx.Warn("自动保存会话失败: %v", serr)
 			}
 			g.post(g.refreshSessions)
 		} else {
 			// 输出中断（手动停止或断网）：部分内容已保留在 Agent 消息中，保存 latest 以便重启后续写。
-			if _, serr := session.Save(app.SessionDir, "latest", ag.Messages()); serr != nil {
+			if _, serr := session.Save(app.SessionDir, "latest", rec); serr != nil {
 				logx.Warn("自动保存会话失败: %v", serr)
 			}
 		}
@@ -1109,6 +1400,7 @@ func (g *gui) finishTurn(err error) {
 	g.running = false
 	g.cancel = nil
 	g.mu.Unlock()
+	g.post(func() { g.closeThink() }) // 回合结束兜底：若思考块仍未折叠（如中断），折叠收尾
 
 	switch {
 	case err == nil:

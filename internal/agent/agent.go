@@ -18,6 +18,8 @@ import (
 type Options struct {
 	// OnContent 收到 LLM 流式文本增量。
 	OnContent func(content string)
+	// OnReasoning 收到模型思考模式（DeepSeek V4）的推理文本增量，通常先于正文到达。
+	OnReasoning func(content string)
 	// OnToolStart 在某工具开始执行时回调。
 	// detail 是工具的可读摘要（如 exec_command 的实际命令文本），非命令工具时为工具名。
 	OnToolStart func(name, detail string)
@@ -120,6 +122,22 @@ func (a *Agent) Messages() []llm.Message { return a.messages }
 // SetMessages 恢复会话历史（用于 /load）。
 func (a *Agent) SetMessages(m []llm.Message) { a.messages = m }
 
+// sendMessages 返回发送给 API 的消息副本，按 DeepSeek V4 思考模式规则处理 reasoning_content：
+//   - 带 tool_calls 的 assistant 消息必须原样完整回传（缺失会返回 400，见官方文档 thinking_mode）；
+//   - 纯文本 assistant 消息不回传 reasoning_content（官方建议，减少 token，缓存前缀更稳定）。
+//
+// 会话内消息（a.messages）始终保留推理文本，供 GUI 展示与恢复；仅在发送边界剥离。
+func (a *Agent) sendMessages() []llm.Message {
+	out := make([]llm.Message, len(a.messages))
+	copy(out, a.messages)
+	for i := range out {
+		if out[i].Role == "assistant" && len(out[i].ToolCalls) == 0 {
+			out[i].ReasoningContent = ""
+		}
+	}
+	return out
+}
+
 // Reset 清空会话历史。
 func (a *Agent) Reset() { a.messages = nil }
 
@@ -192,7 +210,7 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 			logx.Warn("上下文自动压缩失败: %v", err)
 		}
 
-		assistant, err := a.llm.Chat(ctx, a.messages, defs, a.opts.OnContent, a.opts.OnUsage)
+		assistant, err := a.llm.Chat(ctx, a.sendMessages(), defs, a.opts.OnContent, a.opts.OnReasoning, a.opts.OnUsage)
 		if err != nil && assistant.Content != "" {
 			// 有已生成的输出时，中断也保留：避免已完成的输出丢失，用户可续写。
 			switch {
@@ -290,7 +308,7 @@ func (a *Agent) compactHistory(ctx context.Context) error {
 	}
 	prompt := "请用中文简要总结以下对话中已完成的工作和关键信息（不超过200字），供后续会话继续使用：\n\n" + b.String()
 	sumMsg := []llm.Message{{Role: "user", Content: prompt}}
-	resp, err := a.llm.Chat(ctx, sumMsg, nil, nil, nil)
+	resp, err := a.llm.Chat(ctx, sumMsg, nil, nil, nil, nil)
 	if err != nil {
 		return err
 	}

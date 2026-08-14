@@ -158,11 +158,11 @@ func TestStore_VecsRoundtrip(t *testing.T) {
 
 func TestGoFiles_SkipDirs(t *testing.T) {
 	root := t.TempDir()
-	os.MkdirAll(filepath.Join(root, ".codegraph"), 0o755)
+	os.MkdirAll(filepath.Join(root, ".go-agent"), 0o755)
 	os.MkdirAll(filepath.Join(root, "build"), 0o755)
 	os.MkdirAll(filepath.Join(root, "vendor"), 0o755)
 	os.WriteFile(filepath.Join(root, "a.go"), []byte("package x\n"), 0o644)
-	os.WriteFile(filepath.Join(root, ".codegraph", "x.go"), []byte("package x\n"), 0o644)
+	os.WriteFile(filepath.Join(root, ".go-agent", "x.go"), []byte("package x\n"), 0o644)
 	os.WriteFile(filepath.Join(root, "build", "b.go"), []byte("package x\n"), 0o644)
 	os.WriteFile(filepath.Join(root, "vendor", "c.go"), []byte("package x\n"), 0o644)
 

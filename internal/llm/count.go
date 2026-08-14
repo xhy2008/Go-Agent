@@ -28,11 +28,12 @@ func CountTokens(text string) int {
 	return approximateTokens(text)
 }
 
-// CountMessages 统计消息列表的总 token 数。
+// CountMessages 统计消息列表的总 token 数（含推理文本：带工具调用的消息会把
+// reasoning_content 回传，占上下文；纯文本消息在发送前已剥离，误差可接受）。
 func CountMessages(messages []Message) int {
 	total := 0
 	for _, m := range messages {
-		total += CountTokens(m.Content)
+		total += CountTokens(m.Content) + CountTokens(m.ReasoningContent)
 		for _, tc := range m.ToolCalls {
 			total += CountTokens(tc.Function.Name) + CountTokens(tc.Function.Arguments)
 		}

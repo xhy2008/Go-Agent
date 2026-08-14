@@ -118,7 +118,8 @@ func main() {
 		stop()
 
 		// 自动保存最新会话
-		if _, err := session.Save(app.SessionDir, "latest", app.Agent.Messages()); err != nil {
+		rec := session.Record{WorkingDir: mustCwd(), Messages: app.Agent.Messages()}
+		if _, err := session.Save(app.SessionDir, "latest", rec); err != nil {
 			fmt.Printf("%s\n", paint("[警告] 保存会话失败: "+err.Error(), "31"))
 			logx.Warn("自动保存会话失败: %v", err)
 		}
@@ -149,7 +150,7 @@ func handleCommand(input string, app *bootstrap.App) (handled, quit bool) {
 		fmt.Println(session.Describe(names))
 		return true, false
 	case input == "/save":
-		if _, err := session.Save(app.SessionDir, "", app.Agent.Messages()); err != nil {
+		if _, err := session.Save(app.SessionDir, "", session.Record{WorkingDir: mustCwd(), Messages: app.Agent.Messages()}); err != nil {
 			logx.Warn("保存会话失败: %v", err)
 			fmt.Printf("%s\n", paint("保存失败: "+err.Error(), "31"))
 		} else {
@@ -162,14 +163,22 @@ func handleCommand(input string, app *bootstrap.App) (handled, quit bool) {
 			fmt.Println("用法: /load <会话名>（可用 /sessions 查看）")
 			return true, false
 		}
-		msgs, err := session.Load(app.SessionDir, name)
+		rec, err := session.Load(app.SessionDir, name)
 		if err != nil {
 			logx.Warn("加载会话 %s 失败: %v", name, err)
 			fmt.Printf("%s\n", paint("加载失败: "+err.Error(), "31"))
 			return true, false
 		}
-		app.Agent.SetMessages(msgs)
-		fmt.Printf("已恢复会话 %s（%d 条消息）。\n", name, len(msgs))
+		// 恢复会话时同步工作目录（Agent 相对路径随其切换）。
+		if rec.WorkingDir != "" {
+			if werr := app.SetWorkspace(rec.WorkingDir); werr != nil {
+				fmt.Printf("%s\n", paint("[警告] 工作目录切换失败: "+werr.Error(), "31"))
+			} else {
+				fmt.Printf("工作目录已切换: %s\n", rec.WorkingDir)
+			}
+		}
+		app.Agent.SetMessages(rec.Messages)
+		fmt.Printf("已恢复会话 %s（%d 条消息）。\n", name, len(rec.Messages))
 		return true, false
 	case strings.HasPrefix(input, "/skills"):
 		// /skills         列出已加载技能

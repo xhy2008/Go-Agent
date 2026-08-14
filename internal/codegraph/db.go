@@ -14,7 +14,7 @@ import (
 )
 
 // DB 封装 codegraph 的 SQLite 持久化：节点/边/文件指纹 + FTS5 全文索引 + 语义向量。
-// 存储文件为 <root>/.codegraph/codegraph.db（贴近原版 codegraph）。
+// 存储文件为 <root>/.go-agent/codegraph.db（与官方 codegraph 的 .codegraph 目录区分，避免 schema 冲突）。
 type DB struct {
 	db *sql.DB
 }

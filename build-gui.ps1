@@ -63,19 +63,65 @@ function Invoke-BuildBridge {
 }
 Invoke-BuildBridge
 
-Write-Output "==> go build -tags fts5 -o build/agent-gui.exe"
-go build -tags fts5 -o (Join-Path $buildDir "agent-gui.exe") ./cmd/agent-gui
+Write-Output "==> go build -tags fts5 -ldflags `"-s -w`" -o build/agent-gui.exe"
+# -s -w：剥离 Go/调试符号。miqt 的 C++ 绑定按 -g 编译，不带此标志的 exe 会携带
+# ~300MB DWARF 调试信息（实测 353MB → 60MB）。
+go build -tags fts5 -ldflags "-s -w" -o (Join-Path $buildDir "agent-gui.exe") ./cmd/agent-gui
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 Write-Output "==> agent-gui.exe built OK"
 
-Write-Output "==> deploy Qt runtime to build/"
-Copy-Item (Join-Path $qtBin "Qt6*.dll") $buildDir -Force
-Copy-Item (Join-Path $qtBin "lib*.dll") $buildDir -Force
-Copy-Item (Join-Path $qtBin "zlib1.dll") $buildDir -Force -ErrorAction SilentlyContinue
+# ---- Qt 运行库部署：只拷贝 exe 实际依赖的 DLL 与平台插件，不再整目录拷贝 ----
+# 递归解析导入表：从 exe/插件出发，凡在 MSYS2 bin 下能找到的 DLL 一并拷贝并继续解析其
+# 依赖；找不到的（系统 DLL）跳过。旧版本残留的无关 DLL（Qt6Network、libpython 等）最后清除。
+function Copy-WithDeps {
+    param(
+        [string]$File,    # 起始文件（exe 或插件）
+        [string]$Dst,     # 目标目录
+        [string]$Bin,     # MSYS2 bin 目录（DLL 来源）
+        [hashtable]$Seen  # 已处理集合（键 = 小写文件名）
+    )
+    $imports = & objdump -p $File 2>$null |
+        Select-String 'DLL Name: (\S+)' |
+        ForEach-Object { $_.Matches[0].Groups[1].Value }
+    foreach ($dll in $imports) {
+        $key = $dll.ToLower()
+        if ($Seen.ContainsKey($key)) { continue }
+        $Seen[$key] = $true
+        $src = Join-Path $Bin $dll
+        if (-not (Test-Path $src)) { continue } # 系统 DLL → 跳过
+        Copy-Item $src (Join-Path $Dst $dll) -Force
+        Copy-WithDeps $src $Dst $Bin $Seen
+    }
+}
+
+Write-Output "==> deploy Qt runtime to build/ (dependency-resolved)"
+# 清掉旧插件目录（platforms 重建），保留运行数据目录（models/ sessions/ skills/ 等）。
 foreach ($cat in @("platforms", "styles", "imageformats", "tls", "networkinformation", "generic")) {
-    $src = Join-Path $qtPlugin $cat
-    if (Test-Path $src) {
-        Copy-Item $src $buildDir -Recurse -Force
+    Remove-Item (Join-Path $buildDir $cat) -Recurse -Force -ErrorAction SilentlyContinue
+}
+$seen = @{}
+Copy-WithDeps (Join-Path $buildDir "agent-gui.exe") $buildDir $qtBin $seen
+# 平台插件 qwindows.dll（Qt6Gui 加载 Windows 平台必需），并解析其依赖。
+$platDir = Join-Path $buildDir "platforms"
+New-Item -ItemType Directory -Force -Path $platDir | Out-Null
+$qw = Join-Path $qtPlugin "platforms\qwindows.dll"
+Copy-Item $qw (Join-Path $platDir "qwindows.dll") -Force
+Copy-WithDeps $qw $buildDir $qtBin $seen
+# 样式插件 qmodernwindowsstyle.dll：Qt 6.7+ 在 Windows 上默认采用 modernwindows 圆角风格，
+# 缺少该插件会回退为原生样式，造成 UI 风格不一致。
+$stylesDir = Join-Path $buildDir "styles"
+New-Item -ItemType Directory -Force -Path $stylesDir | Out-Null
+Get-ChildItem (Join-Path $qtPlugin "styles") -Filter *.dll -ErrorAction SilentlyContinue | ForEach-Object {
+    Copy-Item $_.FullName (Join-Path $stylesDir $_.Name) -Force
+    Copy-WithDeps $_.FullName $buildDir $qtBin $seen
+}
+# 清除解析集之外的多余 DLL（保留 llama_bridge.dll）。
+$resolved = New-Object 'System.Collections.Generic.HashSet[string]'
+foreach ($k in $seen.Keys) { [void]$resolved.Add($k) }
+[void]$resolved.Add("llama_bridge.dll")
+Get-ChildItem $buildDir -Filter *.dll | ForEach-Object {
+    if (-not $resolved.Contains($_.Name.ToLower())) {
+        Remove-Item $_.FullName -Force
     }
 }
 Write-Output "==> build/agent-gui.exe ready"

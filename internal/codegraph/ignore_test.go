@@ -241,8 +241,10 @@ func TestGoFilesIntegration(t *testing.T) {
 	writeTree(t, root,
 		"main.go",
 		"cmd/app/main.go",
-		".codegraph/data.go",      // 数据目录，始终跳过
-		".codegraph-other/x.go",   // 数据目录变体
+		".go-agent/data.go",      // 本应用数据目录，始终跳过
+		".go-agent-other/x.go",   // 本应用数据目录变体
+		".codegraph/off.go",      // 官方 codegraph 数据目录，始终跳过
+		".codegraph-extra/y.go",  // 官方 codegraph 数据目录变体
 		".git/hook.py",            // git 内部
 		"build/out.go",            // 默认忽略
 		"src/secret/generated.go", // 根 .gitignore
@@ -252,8 +254,10 @@ func TestGoFilesIntegration(t *testing.T) {
 	m := filesOf(t, root)
 	assertHas(t, m, "main.go")
 	assertHas(t, m, "cmd/app/main.go")
-	assertNotHas(t, m, ".codegraph/data.go")
-	assertNotHas(t, m, ".codegraph-other/x.go")
+	assertNotHas(t, m, ".go-agent/data.go")
+	assertNotHas(t, m, ".go-agent-other/x.go")
+	assertNotHas(t, m, ".codegraph/off.go")
+	assertNotHas(t, m, ".codegraph-extra/y.go")
 	assertNotHas(t, m, ".git/hook.py")
 	assertNotHas(t, m, "build/out.go")
 	// 父目录 src/secret/ 被忽略 → 子文件无法用 ! 重纳（git 规则，见 TestParentDirRule）

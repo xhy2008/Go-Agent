@@ -20,6 +20,7 @@ func main() {
 
 	bootApp, err := bootstrap.Setup(bootstrap.Options{
 		OnContent:      g.pushText,
+		OnReasoning:    g.pushReasoning,
 		OnToolStart:    func(name, detail string) { g.blockStart(name, detail) },
 		OnToolOutput:   func(line string) { g.cmdLine(line) },
 		OnToolEnd:      func(name string) { g.flushCmd() },

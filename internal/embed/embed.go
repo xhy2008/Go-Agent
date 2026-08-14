@@ -24,6 +24,7 @@ type bridge struct {
 	dim  *syscall.LazyProc // cg_embed_dim(handle) -> int
 	err  *syscall.LazyProc // cg_embed_error(handle, char* buf, int buflen) -> int
 	enc  *syscall.LazyProc // cg_embed_encode(handle, text, float* out, int maxlen) -> int
+	bat  *syscall.LazyProc // cg_embed_encode_batch(handle, texts**, lens*, n, float* out, dim) -> int
 	free *syscall.LazyProc // cg_embed_free(handle)
 }
 
@@ -52,6 +53,7 @@ func loadBridge() error {
 			dim:  dll.NewProc("cg_embed_dim"),
 			err:  dll.NewProc("cg_embed_error"),
 			enc:  dll.NewProc("cg_embed_encode"),
+			bat:  dll.NewProc("cg_embed_encode_batch"),
 			free: dll.NewProc("cg_embed_free"),
 		}
 	})
@@ -150,15 +152,70 @@ func (m *Model) Embed(text string) ([]float32, error) {
 	return out, nil
 }
 
-// EmbedBatch 批量编码（复用同一上下文，逐条 encode）。
+// EmbedBatch 批量编码多条文本：多条文本打包进同一次 llama_decode（每条一个 sequence），
+// 摊薄逐条调用的图构建/同步开销。大项目全量向量化实测逐条 ~20ms/符号，批量后显著下降。
+// 返回与输入等长的向量切片；空文本对应零向量。与 Embed 结果一致（同输入同向量）。
 func (m *Model) EmbedBatch(texts []string) ([][]float32, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.handle == 0 {
+		return nil, fmt.Errorf("embed: 模型已关闭")
+	}
 	out := make([][]float32, len(texts))
-	for i, t := range texts {
-		v, err := m.Embed(t)
-		if err != nil {
-			return nil, err
+	// 每个 decode 批次：最多 64 条，且累计字符数封顶（粗估 token 数，避免单批
+	// 超过 n_ctx=8192 导致 llama_decode 失败；符号文本一般 < 200 字符，64 条约 3-4k token）。
+	const (
+		maxBatch = 64
+		maxChars = 16000
+	)
+	var (
+		ptrs  []uintptr
+		lens  []int32
+		bufs  [][]byte // 保持各 C 字符串存活至调用结束
+		slots []int    // 每条文本在 out 中的下标（空文本不入 batch，需映射回原位）
+		chars int
+	)
+	flush := func() error {
+		if len(ptrs) == 0 {
+			return nil
 		}
-		out[i] = v
+		n := len(ptrs)
+		flat := make([]float32, n*m.nEmbd)
+		ret, _, _ := br.bat.Call(m.handle,
+			uintptr(unsafe.Pointer(&ptrs[0])),
+			uintptr(unsafe.Pointer(&lens[0])),
+			uintptr(n),
+			uintptr(unsafe.Pointer(&flat[0])),
+			uintptr(m.nEmbd))
+		runtime.KeepAlive(bufs)
+		if ret == 0 {
+			return fmt.Errorf("embed: 批量向量化失败: %s", getError(m.handle))
+		}
+		for i := 0; i < n; i++ {
+			out[slots[i]] = append([]float32(nil), flat[i*m.nEmbd:(i+1)*m.nEmbd]...)
+		}
+		ptrs, lens, bufs, slots, chars = nil, nil, nil, nil, 0
+		return nil
+	}
+	for i, t := range texts {
+		if t == "" {
+			out[i] = make([]float32, m.nEmbd) // 空文本 → 零向量（不入 batch）
+			continue
+		}
+		b := cString(t)
+		bufs = append(bufs, b)
+		ptrs = append(ptrs, uintptr(unsafe.Pointer(&b[0])))
+		lens = append(lens, int32(len(t)))
+		slots = append(slots, i)
+		chars += len(t)
+		if len(ptrs) >= maxBatch || chars >= maxChars {
+			if err := flush(); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := flush(); err != nil {
+		return nil, err
 	}
 	return out, nil
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"go-agent/internal/agent"
 	"go-agent/internal/codegraph"
@@ -23,6 +24,7 @@ import (
 // Options 是装配时注入的回调（CLI/GUI 各自实现）。
 type Options struct {
 	OnContent     func(content string)
+	OnReasoning   func(content string) // 模型思考模式推理文本增量（GUI 流式展示用；nil = 不展示）
 	OnToolStart   func(name, detail string)
 	OnToolOutput  func(line string)
 	OnToolEnd     func(name string)
@@ -44,10 +46,30 @@ type App struct {
 	SessionDir string
 	// Codegraph 代码图索引（符号/调用关系），任务完成后自动增量重建。
 	Codegraph *codegraph.Store
-	// CodegraphRoot 索引的项目根目录（进程工作目录，与文件工具一致）。
+	// CodegraphRoot 索引的项目根目录（随工作目录切换，与文件工具一致）。
 	CodegraphRoot string
+	// Workspace 当前工作目录（Agent 相对路径的基准；SetWorkspace 会同步 os.Chdir）。
+	Workspace string
+	// CGSet codegraph 工具集（工作目录切换时同步 Root）。
+	CGSet *tools.CodegraphToolSet
 	// Semantic 语义检索服务（EMBED_MODEL 配置了 GGUF 模型时非 nil）。
 	Semantic *semantic.Service
+	// SemanticDone 在语义检索初始化完成后关闭（成功或失败都会关闭）；
+	// 后台重建索引前等待它，确保首轮索引包含语义向量。未配置模型时立即关闭。
+	SemanticDone chan struct{}
+	// CGEvent 代码图重建生命周期回调（nil = 不报告）。在重建 goroutine 同步调用，
+	// 调用方应尽快返回（UI 更新请自行投递到主线程）。
+	CGEvent func(e CGEvent)
+
+	wsMu         sync.Mutex // 串行化工作目录切换与 codegraph 索引重建
+	codegraphWSD string     // 当前 Codegraph 索引对应的工作目录（避免重复加载）
+}
+
+// CGEvent 代码图重建生命周期事件。
+type CGEvent struct {
+	Kind        string // "start" | "progress" | "done"
+	Phase       codegraph.ProgressPhase
+	Done, Total int
 }
 
 // Setup 完成全部启动装配。调用方负责在退出时调用 app.Close()。
@@ -98,18 +120,13 @@ func Setup(opts Options) (*App, error) {
 	// 代码图索引：启动时加载已有索引（若存在），任务完成后后台增量重建
 	wd, _ := os.Getwd()
 	app.CodegraphRoot = wd
+	app.Workspace = wd
+	app.codegraphWSD = wd
 	app.Codegraph = codegraph.LoadStore(wd)
-	// 语义检索：embedding 模型路径来自 config.json embedding.model（环境变量 EMBED_MODEL 可覆盖，
-	// "off"/"0" 显式关闭）；配置了模型时加载 llama_bridge.dll 全量向量化 + 语义重排，否则回退 FTS5
-	if mp := embedModelPath(cfg); mp != "" {
-		if s, serr := semantic.Load(mp, embed.PoolLast); serr == nil {
-			app.Semantic = s
-			app.Codegraph.VecBuilder = s.VecBuilder()
-			logx.Info("语义检索已启用（模型 %s）", mp)
-		} else {
-			logx.Warn("语义检索启用失败（将回退 FTS5 全文检索）: %v", serr)
-		}
-	}
+	app.wireCGProgress() // 索引重建进度桥接到 CGEvent（GUI 展示用；语义就绪后自动补接向量化进度）
+	// 语义检索：模型路径来自 config.json embedding.model（EMBED_MODEL 可覆盖，"off"/"0" 关闭）。
+	// 加载 llama.cpp 模型较慢，改为后台异步加载（SemanticDone 关闭即就绪/失败），不阻塞窗口出现。
+	app.startSemantic(cfg)
 	// 细粒度 codegraph 工具集：FTS5 全文检索 + 可选语义重排 + 图遍历
 	// （search/node/callers/callees/trace/impact，各自只返回所需子集）
 	cgSet := &tools.CodegraphToolSet{
@@ -124,6 +141,7 @@ func Setup(opts Options) (*App, error) {
 			return db.Search(query, limit)
 		},
 	}
+	app.CGSet = cgSet
 	app.Registry.Register(&tools.CodegraphSearchTool{CodegraphToolSet: cgSet})
 	app.Registry.Register(&tools.CodegraphNodeTool{CodegraphToolSet: cgSet})
 	app.Registry.Register(&tools.CodegraphCallersTool{CodegraphToolSet: cgSet})
@@ -147,6 +165,7 @@ func Setup(opts Options) (*App, error) {
 
 	app.Agent = agent.New(app.Client, app.Registry, agent.Options{
 		OnContent:     opts.OnContent,
+		OnReasoning:   opts.OnReasoning,
 		OnToolStart:   opts.OnToolStart,
 		OnToolEnd:     opts.OnToolEnd,
 		OnTokenCount:  opts.OnTokenCount,
@@ -157,7 +176,8 @@ func Setup(opts Options) (*App, error) {
 		// 任务结束（成功/出错/中断）后后台增量重建代码图索引，不阻塞下一次输入
 		OnTaskDone: func() {
 			go func() {
-				ix, err := app.Codegraph.Reindex(app.CodegraphRoot)
+				<-app.SemanticDone // 等待语义初始化完成，首轮索引包含语义向量
+				ix, err := app.ReindexCodegraph()
 				if err != nil {
 					logx.Warn("codegraph 索引重建失败: %v", err)
 					return
@@ -169,7 +189,8 @@ func Setup(opts Options) (*App, error) {
 
 	// 启动后异步预热索引，使首次 codegraph_explore 查询即可用
 	go func() {
-		if ix, err := app.Codegraph.Reindex(app.CodegraphRoot); err == nil && ix != nil {
+		<-app.SemanticDone
+		if ix, err := app.ReindexCodegraph(); err == nil && ix != nil {
 			logx.Info("codegraph 索引就绪: %d 符号 / %d 关系", len(ix.Nodes), len(ix.Edges))
 		}
 	}()
@@ -180,6 +201,109 @@ func Setup(opts Options) (*App, error) {
 
 	app.SessionDir, _ = config.SessionDir()
 	return app, nil
+}
+
+// SetWorkspace 切换当前工作目录：同步 os.Chdir，并让 codegraph 索引根/工具集跟随。
+// Agent 的相对路径（读文件、执行命令）从此以 dir 为基准。
+// 不阻塞调用线程：codegraph 索引在后台切换到新工作区（由 ReindexCodegraph 保证一致性）。
+func (a *App) SetWorkspace(dir string) error {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	st, err := os.Stat(abs)
+	if err != nil || !st.IsDir() {
+		return fmt.Errorf("工作目录不存在: %s", abs)
+	}
+	if err := os.Chdir(abs); err != nil {
+		return err
+	}
+	a.Workspace = abs
+	a.CodegraphRoot = abs
+	if a.CGSet != nil {
+		a.CGSet.Root = abs
+	}
+	if a.Codegraph == nil || a.codegraphWSD != abs {
+		// 后台切换到新工作区并预热索引（ReindexCodegraph 内部先换 Store 再重建，带锁）。
+		go func() {
+			<-a.SemanticDone
+			if ix, err := a.ReindexCodegraph(); err == nil && ix != nil {
+				logx.Info("codegraph 索引就绪: %d 符号 / %d 关系", len(ix.Nodes), len(ix.Edges))
+			}
+		}()
+	}
+	return nil
+}
+
+// startSemantic 后台加载语义检索（llama.cpp embedding 模型）。模型加载较慢，
+// 异步执行避免阻塞窗口出现；SemanticDone 在加载完成（成功或失败）后关闭。
+func (a *App) startSemantic(cfg *config.Config) {
+	a.SemanticDone = make(chan struct{})
+	mp := embedModelPath(cfg)
+	if mp == "" {
+		close(a.SemanticDone) // 未配置 → 立即就绪（回退 FTS5）
+		return
+	}
+	go func() {
+		defer close(a.SemanticDone)
+		s, serr := semantic.Load(mp, embed.PoolLast)
+		if serr != nil {
+			logx.Warn("语义检索启用失败（将回退 FTS5 全文检索）: %v", serr)
+			return
+		}
+		a.wsMu.Lock()
+		a.Semantic = s
+		a.wireCGProgress() // 语义就绪后补接逐符号向量化进度
+		a.wsMu.Unlock()
+		logx.Info("语义检索已启用（模型 %s）", mp)
+	}()
+}
+
+// ReindexCodegraph 重建当前工作区的代码图索引。
+// 若工作目录已切换而索引 Store 尚未跟随（SetWorkspace 异步切换），先在此锁内换 Store 再重建；
+// 与 SetWorkspace 互斥（避免重建期间旧 Store 被关闭），线程安全。
+// 重建结束后上报 CGEvent{Kind:"done"}，供 UI 清理自动重建的状态栏进度文本。
+func (a *App) ReindexCodegraph() (*codegraph.Index, error) {
+	a.wsMu.Lock()
+	defer a.wsMu.Unlock()
+	if a.codegraphWSD != a.CodegraphRoot {
+		old := a.Codegraph
+		a.Codegraph = codegraph.LoadStore(a.CodegraphRoot)
+		a.wireCGProgress() // 新 Store 需重新接进度桥
+		a.codegraphWSD = a.CodegraphRoot
+		if old != nil {
+			old.Close()
+		}
+	}
+	ix, err := a.Codegraph.Reindex(a.CodegraphRoot)
+	if a.CGEvent != nil {
+		a.CGEvent(CGEvent{Kind: "done"})
+	}
+	return ix, err
+}
+
+// wireCGProgress 把 codegraph 重建进度桥接到 CGEvent（CGEvent 为 nil 时不报告）。
+// 调用方须持有 wsMu（Reindex 期间）或保证无并发（Setup 阶段）：
+//   - OnProgress：扫描/解析/建图/保存阶段的整体进度；
+//   - VecBuilder：语义向量化逐符号进度（最耗时阶段，逐符号上报让 UI 看到进展）。
+func (a *App) wireCGProgress() {
+	if a.Codegraph == nil {
+		return
+	}
+	a.Codegraph.OnProgress = func(p codegraph.Progress) {
+		if a.CGEvent != nil {
+			a.CGEvent(CGEvent{Kind: "progress", Phase: p.Phase, Done: p.Done, Total: p.Total})
+		}
+	}
+	if a.Semantic != nil {
+		a.Codegraph.VecBuilder = a.Semantic.VecBuilderWithProgress(func(done, total int) {
+			if a.CGEvent != nil {
+				a.CGEvent(CGEvent{Kind: "progress", Phase: codegraph.ProgressVec, Done: done, Total: total})
+			}
+		})
+	} else {
+		a.Codegraph.VecBuilder = nil
+	}
 }
 
 // probeModels 查询 /models 并上报结果。

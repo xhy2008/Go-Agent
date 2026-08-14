@@ -12,10 +12,47 @@ import (
 )
 
 const (
-	IndexDirName  = ".codegraph"
+	// 本应用索引数据目录名：与官方 codegraph 的 .codegraph 区分开，避免两个不同 schema
+	// 的数据库共用同名目录而互相干扰（如 MCP 读到本应用的库而报 schema 错误）。
+	IndexDirName  = ".go-agent"
 	IndexFileName = "codegraph.db"
 	lockFileName  = "index.lock"
+
+	// 官方 codegraph（MCP/CLI）管理的目录，扫描时同样跳过，避免误索引其数据。
+	OfficialIndexDirName = ".codegraph"
 )
+
+// ProgressPhase 索引重建阶段。
+type ProgressPhase string
+
+const (
+	ProgressScan  ProgressPhase = "scan"   // 扫描目录 / 计算指纹
+	ProgressParse ProgressPhase = "parse"  // 解析源码
+	ProgressBuild ProgressPhase = "build"  // 建立关系图
+	ProgressVec   ProgressPhase = "vec"    // 语义向量化
+	ProgressSave  ProgressPhase = "save"   // 落盘
+)
+
+// Progress 重建进度。Done/Total 均为 0 表示该阶段总进度未知（不确定进度）。
+type Progress struct {
+	Phase ProgressPhase
+	Done  int
+	Total int
+}
+
+// vecKey 是符号的身份键：相同身份 → 相同 embedding 输入文本 → 相同向量。
+// 用于增量重建时复用旧索引中未变更符号的向量（全量重算是大项目向量化的主要瓶颈）。
+type vecKey struct {
+	file, kind string
+	name       string
+	receiver   string
+	signature  string
+	doc        string
+}
+
+func nodeVecKey(n *Node) vecKey {
+	return vecKey{n.File, n.Kind.String(), n.Name, n.Receiver, n.Signature, n.Doc}
+}
 
 // Store 持有最近构建的索引与词法文件图缓存，支持进程内增量重建与并发查询。
 type Store struct {
@@ -29,6 +66,10 @@ type Store struct {
 	// 每次 Reindex 构建索引后调用：入参全部符号，返回 node ID → 向量 与维度。
 	// 由 internal/semantic 通过 VecBuilder 方法提供，codegraph 保持不依赖模型运行时。
 	VecBuilder func(nodes []Node) (map[int][]float32, int, error)
+
+	// OnProgress 重建进度回调（nil = 不报告）。在 Reindex 所在 goroutine 同步调用，
+	// 调用方应尽快返回（UI 更新请自行投递到主线程）。
+	OnProgress func(p Progress)
 }
 
 // NewStore 创建空 Store。
@@ -77,6 +118,13 @@ func (s *Store) Index() *Index {
 	return s.index
 }
 
+// report 发送进度（OnProgress 为空时静默）。
+func (s *Store) report(phase ProgressPhase, done, total int) {
+	if s.OnProgress != nil {
+		s.OnProgress(Progress{Phase: phase, Done: done, Total: total})
+	}
+}
+
 // Reindex 增量重建 root 的索引：未变更文件复用缓存图，仅重解析变更/新增文件。
 // 结果原子落盘（跨进程以 index.lock 非阻塞互斥）。
 func (s *Store) Reindex(root string) (*Index, error) {
@@ -88,9 +136,11 @@ func (s *Store) Reindex(root string) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
+	s.report(ProgressScan, 0, 0) // 扫描完成，总文件数已知
 	fp := make(map[string]string, len(relFiles))
-	for _, rel := range relFiles {
+	for i, rel := range relFiles {
 		fp[rel] = fingerprint(filepath.Join(root, filepath.FromSlash(rel)))
+		s.report(ProgressScan, i+1, len(relFiles)) // 指纹读取进度
 	}
 
 	old := s.index
@@ -118,7 +168,7 @@ func (s *Store) Reindex(root string) (*Index, error) {
 
 	keep := make(map[string]bool, len(relFiles))
 	fgs := make([]*FileGraph, 0, len(relFiles))
-	for _, rel := range relFiles {
+	for i, rel := range relFiles {
 		keep[rel] = true
 		if g, ok := s.graphs[rel]; ok && old.FileFp[rel] == fp[rel] {
 			fgs = append(fgs, g) // 未变更：复用缓存
@@ -130,6 +180,7 @@ func (s *Store) Reindex(root string) (*Index, error) {
 		}
 		s.graphs[rel] = g
 		fgs = append(fgs, g)
+		s.report(ProgressParse, i+1, len(relFiles)) // 解析进度（复用文件瞬时跳过）
 	}
 	for rel := range s.graphs {
 		if !keep[rel] {
@@ -143,29 +194,66 @@ func (s *Store) Reindex(root string) (*Index, error) {
 func (s *Store) rebuildAll(root string, fp map[string]string, relFiles []string) (*Index, error) {
 	s.graphs = make(map[string]*FileGraph, len(relFiles))
 	fgs := make([]*FileGraph, 0, len(relFiles))
-	for _, rel := range relFiles {
+	for i, rel := range relFiles {
 		g, err := ParseFile(filepath.Join(root, filepath.FromSlash(rel)), rel)
 		if err != nil {
 			continue
 		}
 		s.graphs[rel] = g
 		fgs = append(fgs, g)
+		s.report(ProgressParse, i+1, len(relFiles))
 	}
 	return s.finish(root, fp, fgs)
 }
 
 func (s *Store) finish(root string, fp map[string]string, fgs []*FileGraph) (*Index, error) {
 	modulePath := moduleOf(root)
+	s.report(ProgressBuild, 0, 0) // 建图阶段（无细粒度进度）
 	ix, err := Build(root, modulePath, fgs)
 	if err != nil {
 		return nil, err
 	}
-	// 语义向量化（可选）：在落盘前填充 Vecs，随索引持久化
+	// 语义向量化（可选）：复用旧索引中未变更符号的向量，仅对新增/变更符号调用模型，
+	// 随索引持久化。这是大项目增量重建的关键优化——否则每轮重建都会全量重算 5 万+ 向量。
+	// 逐符号进度由 VecBuilder（semantic.VecBuilderWithProgress）通过 OnProgress 上报。
 	if s.VecBuilder != nil {
-		if vecs, dim, verr := s.VecBuilder(ix.Nodes); verr == nil {
-			ix.Vecs = vecs
-			ix.VecDim = dim
+		oldVecs := make(map[vecKey][]float32)
+		dim := 0
+		if old := s.index; old != nil {
+			dim = old.VecDim
+			if len(old.Vecs) > 0 {
+				for i := range old.Nodes {
+					n := &old.Nodes[i]
+					if v, ok := old.Vecs[n.ID]; ok {
+						oldVecs[nodeVecKey(n)] = v
+					}
+				}
+			}
 		}
+		vecs := make(map[int][]float32, len(ix.Nodes))
+		var embedNodes []Node
+		for i := range ix.Nodes {
+			n := &ix.Nodes[i]
+			if v, ok := oldVecs[nodeVecKey(n)]; ok {
+				vecs[n.ID] = v // 未变更符号：直接复用旧向量
+			} else {
+				embedNodes = append(embedNodes, *n)
+			}
+		}
+		s.report(ProgressVec, 0, len(ix.Nodes))
+		if len(embedNodes) > 0 {
+			if vv, d, verr := s.VecBuilder(embedNodes); verr == nil {
+				for id, v := range vv {
+					vecs[id] = v
+				}
+				if d > 0 {
+					dim = d
+				}
+			}
+		}
+		ix.Vecs = vecs
+		ix.VecDim = dim
+		s.report(ProgressVec, len(ix.Nodes), len(ix.Nodes))
 	}
 	valid := make(map[string]string, len(fgs))
 	for _, g := range fgs {
@@ -184,6 +272,7 @@ func (s *Store) finish(root string, fp map[string]string, fgs []*FileGraph) (*In
 		}
 		s.db = db
 	}
+	s.report(ProgressSave, 0, 0)
 	lockPath := filepath.Join(root, IndexDirName, lockFileName)
 	lf, lerr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
 	if lerr == nil {
@@ -191,6 +280,7 @@ func (s *Store) finish(root string, fp map[string]string, fgs []*FileGraph) (*In
 		lf.Close()
 		os.Remove(lockPath)
 	}
+	s.report(ProgressSave, 1, 1)
 
 	s.index = ix
 	return ix, lerr
@@ -198,8 +288,8 @@ func (s *Store) finish(root string, fp map[string]string, fgs []*FileGraph) (*In
 
 // goFiles 收集项目内全部支持的源文件（相对路径，正斜杠）。
 // 忽略规则对齐官方 codegraph：默认忽略清单 + 根/嵌套 .gitignore 过滤，
-// 目录被忽略时整棵子树跳过；.git 与索引数据目录（.codegraph 及 .codegraph-*）
-// 始终跳过；>1MB 文件跳过（生成的 bundle/压缩产物）。
+// 目录被忽略时整棵子树跳过；.git 与本应用索引目录（.go-agent 及 .go-agent-*）及官方
+// codegraph 目录（.codegraph 及 .codegraph-*）始终跳过；>1MB 文件跳过（生成的 bundle/压缩产物）。
 func goFiles(root string) ([]string, error) {
 	base := scopedIgnore{dir: root, ig: buildDefaultIgnore(root)}
 	var out []string
@@ -224,8 +314,10 @@ func collectFiles(root, dir string, matchers []scopedIgnore, out *[]string) {
 	}
 	for _, e := range entries {
 		name := e.Name()
-		// 不进入 git 内部与 CodeGraph 数据目录（含 .codegraph-* 变体，对齐原版）。
-		if name == ".git" || name == IndexDirName || strings.HasPrefix(name, IndexDirName+"-") {
+		// 不进入 git 内部与本应用索引数据目录（.go-agent(-*)），也跳过官方 codegraph
+		// MCP 管理的 .codegraph(-*)（两套 schema 不同，互不读写，避免误索引对方数据）。
+		if name == ".git" || name == IndexDirName || strings.HasPrefix(name, IndexDirName+"-") ||
+			name == OfficialIndexDirName || strings.HasPrefix(name, OfficialIndexDirName+"-") {
 			continue
 		}
 		full := filepath.Join(dir, name)

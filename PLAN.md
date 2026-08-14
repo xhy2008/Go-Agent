@@ -19,11 +19,11 @@
 | 维度 | 范围 | 说明 |
 | :--- | :--- | :--- |
 | 语言 | Go + 主流 15 种（统一 tree-sitter） | **全部语言（含 Go）统一走 tree-sitter**（`tslangs` 通用提取器，一套 `decls` 声明映射表驱动，仅按语法节点差异少量适配）；移除 go/ast、go/types 分流；冷门语言（COBOL/ArkTS/CFML 等）暂未覆盖，注册表可扩展 |
-| 存储 | SQLite（v2） | `<项目根>/.codegraph/codegraph.db`（nodes/edges/files/vecs/meta 表 + **contentless FTS5** 虚拟表 nodes_fts）；单连接 + 跨进程互斥锁；符号向量以二进制 blob 持久化；**移除 gob** |
+| 存储 | SQLite（v2） | `<项目根>/.go-agent/codegraph.db`（nodes/edges/files/vecs/meta 表 + **contentless FTS5** 虚拟表 nodes_fts）；单连接 + 跨进程互斥锁；符号向量以二进制 blob 持久化；**移除 gob** |
 | 全文检索 | SQLite FTS5（v2） | `Search(query, limit)` 执行 `nodes_fts MATCH ? ORDER BY rank`，替代旧的内存词法打分 |
 | 语义检索 | 词法 + 可选本地 embedding（v2 改 DLL） | 可选接入 llama.cpp（**DLL 动态链接** `llama_bridge.dll`，syscall.NewLazyDLL 按需加载，带 Vulkan 加速/CPU 回退）加载 GGUF embedding 模型（默认 nomic-embed-text-v1.5，768 维）；**仅配置 `embedding.model`（config.json，`EMBED_MODEL` 可覆盖）时加载 DLL**；查询时 FTS5 候选 → 语义重排；未配置模型时**完全不加载 DLL**，回退原版 codegraph 的 FTS5 全文检索方案 |
 | 调用链 | 深度图遍历（v2） | `CallersOf(id, depth)`（入边 BFS）、`Trace(id, depth)`（双向 BFS）、`BlastRadius(id, depth)`（出边 BFS）；BFS 按前进方向节点去重 |
-| 索引位置 | `<项目根>/.codegraph/` | 与文件工具一致以进程工作目录为项目根；`.codegraph/` 已 gitignore |
+| 索引位置 | `<项目根>/.go-agent/` | 与文件工具一致以进程工作目录为项目根；`.go-agent/` 已 gitignore；用 `.go-agent` 而非官方 codegraph 的 `.codegraph`，避免 schema 冲突 |
 | 触发时机 | Agent.Run 结束后台重建 | 增量（mtime+sha256 指纹），变更文件才重解析 |
 
 ---
@@ -291,7 +291,7 @@ MatchByID(root, id)：   单符号完整上下文（Source + EdgesOf + BlastRadi
 ### 已知限制（v2）
 
 1. **词法级解析**：全部语言为词法级 tree-sitter（声明/调用/签名/Doc），无类型感知；跨包引用按模块语义词法解析，同名多候选放弃（精确优先）。删除 go/types 后此限制适用于全部语言（含 Go），换取多语言行为一致与更低的维护成本。
-2. **目录扫描**：默认忽略清单（与官方 `DEFAULT_IGNORE_PATTERNS` **完全一致**，约 90 个依赖/构建/缓存目录 + `*.egg-info/`/`cmake-build-*/`/`bazel-*/`/`**/res/{values,…}*/`）+ 根/嵌套 `.gitignore`（根与默认合并，支持 `!` 否定默认；嵌套相对其目录求值）+ >1MB 文件跳过；`.git` 与 `.codegraph(-*)` 始终跳过；目录被忽略即不进入（父目录规则天然成立）。vendored 源码目录（如 `third_party/`）不硬编码忽略，由项目 `.gitignore` 治理。已与官方 `scanDirectoryWalk` 对 32 文件/20+ 场景比对，默认清单对齐后输出**完全一致**；差异：`?` 按字面量、不跟随 symlink、不走 `git ls-files`、无 codegraph.json include/exclude。
+2. **目录扫描**：默认忽略清单（与官方 `DEFAULT_IGNORE_PATTERNS` **完全一致**，约 90 个依赖/构建/缓存目录 + `*.egg-info/`/`cmake-build-*/`/`bazel-*/`/`**/res/{values,…}*/`）+ 根/嵌套 `.gitignore`（根与默认合并，支持 `!` 否定默认；嵌套相对其目录求值）+ >1MB 文件跳过；`.git` 与 `.go-agent(-*)` 始终跳过；目录被忽略即不进入（父目录规则天然成立）。vendored 源码目录（如 `third_party/`）不硬编码忽略，由项目 `.gitignore` 治理。已与官方 `scanDirectoryWalk` 对 32 文件/20+ 场景比对，默认清单对齐后输出**完全一致**；差异：`?` 按字面量、不跟随 symlink、不走 `git ls-files`、无 codegraph.json include/exclude。
 3. **FTS5 构建约束**：必须 `-tags fts5`（go-sqlite3 默认仅 FTS3），否则 `no such module: fts5`。
 4. **Windows SQLite 文件锁**：一个 db 文件仅支持单连接，测试/多实例需 `Close()` 释放。
 5. **首个全量构建/向量化较慢**：启用 embedding 后首次索引需向量化全量符号（本项目 630 符号约 60s），后台执行不阻塞交互。

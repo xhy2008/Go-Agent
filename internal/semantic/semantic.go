@@ -57,21 +57,36 @@ func nodeText(n *codegraph.Node) string {
 	return b.String()
 }
 
-// vecs 为全部符号生成向量（node ID → 向量）与维度。
-func (s *Service) vecs(nodes []codegraph.Node) (map[int][]float32, int, error) {
+// vecs 为全部符号生成向量（node ID → 向量）与维度。on 非空时逐符号报告进度。
+func (s *Service) vecs(nodes []codegraph.Node, on func(done, total int)) (map[int][]float32, int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.model == nil {
 		return nil, 0, fmt.Errorf("semantic: 模型未加载")
 	}
+	// 分块批量向量化：多条文本打包进同一次 llama_decode，显著快于逐条 encode；
+	// 分块让进度回调在向量化期间增量触发，而不是全部完成后一次性上报（GUI 进度条依赖此行为）。
+	const chunk = 1024
 	vecs := make(map[int][]float32, len(nodes))
-	for i := range nodes {
-		n := &nodes[i]
-		v, err := s.model.Embed(nodeText(n))
-		if err != nil {
-			return nil, 0, fmt.Errorf("semantic: 符号 %s 向量化失败: %v", n.Name, err)
+	for start := 0; start < len(nodes); start += chunk {
+		end := start + chunk
+		if end > len(nodes) {
+			end = len(nodes)
 		}
-		vecs[n.ID] = v
+		texts := make([]string, end-start)
+		for i := start; i < end; i++ {
+			texts[i-start] = nodeText(&nodes[i])
+		}
+		vs, err := s.model.EmbedBatch(texts)
+		if err != nil {
+			return nil, 0, fmt.Errorf("semantic: 向量化失败: %v", err)
+		}
+		for i := start; i < end; i++ {
+			vecs[nodes[i].ID] = vs[i-start]
+			if on != nil {
+				on(i+1, len(nodes))
+			}
+		}
 	}
 	return vecs, s.model.Dim(), nil
 }
@@ -79,13 +94,23 @@ func (s *Service) vecs(nodes []codegraph.Node) (map[int][]float32, int, error) {
 // VecBuilder 返回可供 codegraph.Store 注册的全量向量化回调：
 // 每次 Reindex 构建索引后调用，随索引持久化（node ID → 向量）。
 func (s *Service) VecBuilder() func(nodes []codegraph.Node) (map[int][]float32, int, error) {
-	return s.vecs
+	return func(nodes []codegraph.Node) (map[int][]float32, int, error) {
+		return s.vecs(nodes, nil)
+	}
+}
+
+// VecBuilderWithProgress 同 VecBuilder，但逐符号报告进度（done/total），
+// 供 UI 在重建索引期间展示向量化进度。
+func (s *Service) VecBuilderWithProgress(on func(done, total int)) func(nodes []codegraph.Node) (map[int][]float32, int, error) {
+	return func(nodes []codegraph.Node) (map[int][]float32, int, error) {
+		return s.vecs(nodes, on)
+	}
 }
 
 // Index 为 ix 的全部符号生成向量并填充 ix.Vecs / ix.VecDim（原地修改）。
 // 任一符号向量化失败即整体失败并保持原 Vecs 不变（调用方回退词法）。
 func (s *Service) Index(ix *codegraph.Index) error {
-	vecs, dim, err := s.vecs(ix.Nodes)
+	vecs, dim, err := s.vecs(ix.Nodes, nil)
 	if err != nil {
 		return err
 	}
